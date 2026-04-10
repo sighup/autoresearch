@@ -57,13 +57,14 @@ If no assertions file exists, guide the user through creating one. Read the prom
 >
 > Which of these matter most? Are there other properties you want to enforce? I'll turn these into assertions — binary pass/fail checks that each test case must satisfy.
 
-Based on the user's response, generate `.autoresearch/assertions.py` with concrete assertion functions. Reference `${CLAUDE_PLUGIN_ROOT}/evals/assertions.py` for the expected format.
+Based on the user's response, generate `.autoresearch/assertions.py`. Read `${CLAUDE_PLUGIN_ROOT}/skills/autoresearch/references/assertions_format.py` for the expected format.
 
 Good assertions are:
 - **Structural** — Check that sections, formats, or patterns exist (not subjective quality)
 - **Binary** — Unambiguous pass or fail
 - **Independent** — Each tests one thing
 - **Named clearly** — `assert_has_error_handling` not `assert_check_3`
+- **Pure stdlib** — Only use `re`, `json`, `string`, etc. No external dependencies.
 
 ### Step 3: Identify or create test cases
 

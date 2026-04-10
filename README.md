@@ -101,8 +101,6 @@ ASSERTIONS = [
 ]
 ```
 
-An example assertions file is included in the plugin at `evals/assertions.py` for reference.
-
 These files can live anywhere in your project. You can either place them directly in `.autoresearch/` or point to them from `.autoresearch/config.json`:
 
 ```json
