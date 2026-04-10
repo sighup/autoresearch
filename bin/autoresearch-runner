@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""AutoResearch evaluation runner.
+
+Evaluates prompts against test cases using binary assertions.
+Uses the Claude Code CLI (`claude -p`) — no separate API key needed.
+
+Reads .autoresearch/config.json from the current working directory to
+locate the assertions module and test cases. All working state (prompts,
+candidates, results) lives under .autoresearch/.
+
+Usage:
+    autoresearch-runner                              # Evaluate current prompt
+    autoresearch-runner .autoresearch/prompts/candidates/v1a.txt
+    autoresearch-runner --all-candidates
+"""
+
+import argparse
+import importlib.util
+import json
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+AUTORESEARCH_DIR = ".autoresearch"
+CONFIG_FILE = f"{AUTORESEARCH_DIR}/config.json"
+DEFAULT_PROMPT = f"{AUTORESEARCH_DIR}/prompts/current.txt"
+DEFAULT_TEST_CASES = f"{AUTORESEARCH_DIR}/test_cases.jsonl"
+DEFAULT_ASSERTIONS = f"{AUTORESEARCH_DIR}/assertions.py"
+CANDIDATES_DIR = f"{AUTORESEARCH_DIR}/prompts/candidates"
+RESULTS_DIR = f"{AUTORESEARCH_DIR}/results"
+SCORES_FILE = f"{RESULTS_DIR}/scores.json"
+LATEST_RUN_FILE = f"{RESULTS_DIR}/latest_run.json"
+
+EVAL_MODEL = "sonnet"
+
+
+def load_config() -> dict:
+    """Load config from .autoresearch/config.json if it exists."""
+    config_path = Path(CONFIG_FILE)
+    if config_path.exists():
+        return json.loads(config_path.read_text())
+    return {}
+
+
+def load_assertions(assertions_path: str):
+    """Dynamically load assertions from the given Python file."""
+    path = Path(assertions_path)
+    if not path.exists():
+        print(f"ERROR: Assertions file not found: {assertions_path}")
+        sys.exit(1)
+    spec = importlib.util.spec_from_file_location("assertions", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not hasattr(module, "ASSERTIONS"):
+        print(f"ERROR: {assertions_path} must define an ASSERTIONS list")
+        sys.exit(1)
+    return module.ASSERTIONS
+
+
+def _set_model(model: str):
+    global EVAL_MODEL
+    EVAL_MODEL = model
+
+
+def load_test_cases(path: str) -> list[dict]:
+    return [json.loads(line) for line in Path(path).read_text().strip().split("\n")]
+
+
+def call_claude(system_prompt: str, user_input: str) -> str:
+    """Call Claude Code CLI in print mode with a system prompt."""
+    result = subprocess.run(
+        [
+            "claude", "-p",
+            "--model", EVAL_MODEL,
+            "--system-prompt", system_prompt,
+            "--no-session-persistence",
+            "--tools", "",
+        ],
+        input=user_input,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"claude exited {result.returncode}: {result.stderr.strip()}")
+    return result.stdout
+
+
+def evaluate_prompt(prompt_path: str, test_cases_path: str, assertions: list) -> float:
+    """Evaluate a prompt against all test cases. Returns pass rate."""
+    prompt = Path(prompt_path).read_text()
+    test_cases = load_test_cases(test_cases_path)
+
+    passed = 0
+    results = []
+    total = len(test_cases)
+
+    print(f"\nEvaluating: {prompt_path}")
+    print(f"Test cases: {total}")
+    print(f"Assertions: {len(assertions)}")
+    print(f"Model: {EVAL_MODEL}")
+    print("-" * 60)
+
+    for i, case in enumerate(test_cases, 1):
+        print(f"  [{i}/{total}] {case['id']}...", end=" ", flush=True)
+        start = time.time()
+
+        try:
+            output = call_claude(prompt, case["input"])
+            elapsed = time.time() - start
+
+            assertion_results = {}
+            for fn in assertions:
+                try:
+                    assertion_results[fn.__name__] = fn(output)
+                except Exception as e:
+                    assertion_results[fn.__name__] = False
+                    print(f"\n    WARNING: {fn.__name__} raised {e}")
+
+            case_passed = all(assertion_results.values())
+            failed_assertions = [k for k, v in assertion_results.items() if not v]
+
+            results.append({
+                "id": case["id"],
+                "category": case.get("category", "unknown"),
+                "passed": case_passed,
+                "assertions": assertion_results,
+                "failed": failed_assertions,
+                "output_length": len(output),
+                "elapsed_seconds": round(elapsed, 1),
+            })
+
+            if case_passed:
+                passed += 1
+                print(f"PASS ({elapsed:.1f}s)")
+            else:
+                print(f"FAIL ({elapsed:.1f}s) [{', '.join(failed_assertions)}]")
+
+        except Exception as e:
+            elapsed = time.time() - start
+            print(f"ERROR ({elapsed:.1f}s): {e}")
+            results.append({
+                "id": case["id"],
+                "category": case.get("category", "unknown"),
+                "passed": False,
+                "assertions": {},
+                "failed": ["cli_error"],
+                "error": str(e),
+                "elapsed_seconds": round(elapsed, 1),
+            })
+
+    pass_rate = passed / total if total > 0 else 0
+
+    # Assertion-level pass rates
+    assertion_rates = {}
+    for fn in assertions:
+        name = fn.__name__
+        assertion_passed = sum(1 for r in results if r["assertions"].get(name, False))
+        assertion_rates[name] = round(assertion_passed / total, 3) if total > 0 else 0
+
+    run_result = {
+        "prompt": prompt_path,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "model": EVAL_MODEL,
+        "pass_rate": round(pass_rate, 3),
+        "passed": passed,
+        "total": total,
+        "assertion_pass_rates": assertion_rates,
+        "results": results,
+    }
+
+    # Save latest run
+    Path(RESULTS_DIR).mkdir(parents=True, exist_ok=True)
+    Path(LATEST_RUN_FILE).write_text(json.dumps(run_result, indent=2))
+
+    # Append to scores history
+    scores_path = Path(SCORES_FILE)
+    scores = json.loads(scores_path.read_text()) if scores_path.exists() else []
+    scores.append({
+        "prompt": prompt_path,
+        "timestamp": run_result["timestamp"],
+        "pass_rate": run_result["pass_rate"],
+        "assertion_pass_rates": assertion_rates,
+    })
+    scores_path.write_text(json.dumps(scores, indent=2))
+
+    # Print summary
+    print("\n" + "=" * 60)
+    print(f"PASS RATE: {passed}/{total} ({pass_rate:.1%})")
+    print(f"\nAssertion breakdown:")
+    for name, rate in assertion_rates.items():
+        bar = "#" * int(rate * 20) + "." * (20 - int(rate * 20))
+        print(f"  {name:40s} [{bar}] {rate:.0%}")
+
+    # Show categories with failures
+    categories = {}
+    for r in results:
+        cat = r["category"]
+        if cat not in categories:
+            categories[cat] = {"passed": 0, "total": 0}
+        categories[cat]["total"] += 1
+        if r["passed"]:
+            categories[cat]["passed"] += 1
+
+    print(f"\nCategory breakdown:")
+    for cat, stats in sorted(categories.items()):
+        status = "PASS" if stats["passed"] == stats["total"] else f"{stats['passed']}/{stats['total']}"
+        print(f"  {cat:20s} {status}")
+
+    print("=" * 60)
+
+    return pass_rate
+
+
+def evaluate_all_candidates(test_cases_path: str, assertions: list):
+    """Evaluate all candidate prompts and compare to current."""
+    candidates_dir = Path(CANDIDATES_DIR)
+    candidates = sorted(candidates_dir.glob("*.txt"))
+
+    if not candidates:
+        print(f"No candidates found in {CANDIDATES_DIR}/")
+        return
+
+    print(f"Found {len(candidates)} candidate(s)")
+
+    # Evaluate current first
+    current_rate = evaluate_prompt(DEFAULT_PROMPT, test_cases_path, assertions)
+    rates = [("current", current_rate)]
+
+    for candidate in candidates:
+        rate = evaluate_prompt(str(candidate), test_cases_path, assertions)
+        rates.append((candidate.name, rate))
+
+    # Summary
+    print("\n" + "=" * 60)
+    print("COMPARISON SUMMARY")
+    print("=" * 60)
+    rates.sort(key=lambda x: x[1], reverse=True)
+    for name, rate in rates:
+        marker = " <-- BEST" if rate == rates[0][1] else ""
+        print(f"  {name:30s} {rate:.1%}{marker}")
+
+    best_name, best_rate = rates[0]
+    if best_name != "current" and best_rate > current_rate:
+        print(f"\nCandidate '{best_name}' beats current by {best_rate - current_rate:.1%}")
+        print(f"To promote: cp {CANDIDATES_DIR}/{best_name} {DEFAULT_PROMPT}")
+
+
+SECONDS_PER_CASE = 15  # conservative estimate per test case
+
+
+def estimate_timeout(test_cases_path: str, num_prompts: int = 1) -> int:
+    """Estimate timeout in milliseconds for the run."""
+    test_cases = load_test_cases(test_cases_path)
+    total_calls = len(test_cases) * num_prompts
+    seconds = total_calls * SECONDS_PER_CASE + 30  # 30s buffer
+    return seconds * 1000
+
+
+def print_estimate(test_cases_path: str, all_candidates: bool):
+    """Print estimated time and recommended timeout."""
+    test_cases = load_test_cases(test_cases_path)
+    num_cases = len(test_cases)
+
+    if all_candidates:
+        candidates = sorted(Path(CANDIDATES_DIR).glob("*.txt"))
+        num_prompts = 1 + len(candidates)  # current + candidates
+        label = f"current + {len(candidates)} candidate(s)"
+    else:
+        num_prompts = 1
+        label = "1 prompt"
+
+    total_calls = num_cases * num_prompts
+    est_seconds = total_calls * SECONDS_PER_CASE
+    timeout_ms = est_seconds * 1000 + 30000
+
+    print(f"Prompts: {label}")
+    print(f"Test cases: {num_cases}")
+    print(f"Total API calls: {total_calls}")
+    print(f"Estimated time: ~{est_seconds // 60}m {est_seconds % 60}s")
+    print(f"Recommended timeout: {timeout_ms}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="AutoResearch eval runner")
+    parser.add_argument("prompt", nargs="?", help="Path to prompt file (default: from config or .autoresearch/prompts/current.txt)")
+    parser.add_argument("--all-candidates", action="store_true", help="Evaluate all candidates")
+    parser.add_argument("--test-cases", help="Path to test cases (default: from config)")
+    parser.add_argument("--assertions", help="Path to assertions module (default: from config)")
+    parser.add_argument("--model", default=EVAL_MODEL, help="Model to use (default: sonnet)")
+    parser.add_argument("--estimate", action="store_true", help="Print estimated time and recommended timeout, then exit")
+    args = parser.parse_args()
+
+    _set_model(args.model)
+
+    config = load_config()
+    prompt_path = args.prompt or DEFAULT_PROMPT
+    test_cases_path = args.test_cases or config.get("test_cases", DEFAULT_TEST_CASES)
+    assertions_path = args.assertions or config.get("assertions", DEFAULT_ASSERTIONS)
+
+    if args.estimate:
+        print_estimate(test_cases_path, args.all_candidates)
+        return
+
+    assertions = load_assertions(assertions_path)
+
+    if args.all_candidates:
+        evaluate_all_candidates(test_cases_path, assertions)
+    else:
+        evaluate_prompt(prompt_path, test_cases_path, assertions)
+
+
+if __name__ == "__main__":
+    main()

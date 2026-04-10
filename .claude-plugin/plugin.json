@@ -1,0 +1,9 @@
+{
+  "name": "autoresearch",
+  "version": "0.1.0",
+  "description": "Iterative prompt optimization through automated red-teaming. Evaluates prompts against test cases, analyzes failures, generates targeted variants, and promotes winners.",
+  "author": {
+    "name": "Matt Saliano"
+  },
+  "keywords": ["prompt-optimization", "evals", "red-teaming", "autoresearch"]
+}
