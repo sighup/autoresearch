@@ -3,16 +3,33 @@ name: autoresearch
 description: Iterative prompt optimization loop. Evaluates a prompt against test cases with binary assertions, analyzes failures, generates targeted variants, and promotes winners. Use when optimizing any prompt for higher eval pass rates.
 argument-hint: "[path/to/prompt.txt] [optional goal or constraints]"
 disable-model-invocation: true
-allowed-tools: Bash(autoresearch-runner*) Bash(cp *) Bash(rm *) Bash(mv *) Bash(mkdir *) Read Write Edit Glob Grep AskUserQuestion
+allowed-tools: Bash(autoresearch-runner*) Bash(cp *) Bash(rm *) Bash(mv *) Bash(mkdir *) Bash(git *) Agent Read Write Edit Glob Grep AskUserQuestion
 ---
 
-# AutoResearch: Prompt Optimization Loop
+# AutoResearch: Prompt Optimization
 
-You are running an iterative red-teaming loop to improve a prompt's pass rate against a test suite.
+You help users set up and run iterative prompt optimization.
 
 User arguments: $ARGUMENTS
 
 All working state lives under `.autoresearch/` in the user's current working directory.
+
+## Cleanup mode
+
+If the user's argument is "clean" or "cleanup" (e.g. `/autoresearch clean`), skip everything else. Instead:
+
+1. Check if `.autoresearch/` exists. If not, tell the user there's nothing to clean up.
+2. Show the user what's in `.autoresearch/` — number of result files, candidates, history entries, and the current config.
+3. Ask what they want to do:
+   - **Remove everything** — delete the entire `.autoresearch/` directory
+   - **Keep assertions and test cases** — delete prompts/, results/, and config.json but preserve assertions.py and test_cases.jsonl (useful for re-running later with a different prompt)
+   - **Cancel** — do nothing
+
+After cleanup, confirm what was removed.
+
+## Resume mode
+
+If `.autoresearch/config.json` already exists and the user didn't pass "clean", the setup is already done. Skip to Phase 2 to launch the optimization loop.
 
 ## Phase 1: Guided Setup
 
@@ -101,95 +118,14 @@ Write `.autoresearch/config.json` with the resolved paths:
 }
 ```
 
-## Phase 2: Optimization Loop
+## Phase 2: Launch Optimization Loop
 
-### Project Layout
+After setup is complete (or when resuming an existing config), launch the optimization loop in a subagent:
 
-```
-.autoresearch/
-  config.json              # Points to source prompt, assertions, and test cases
-  assertions.py            # Assertions file (if not located elsewhere)
-  test_cases.jsonl         # Test cases file (if not located elsewhere)
-  prompts/
-    current.txt            # Working copy of the prompt being optimized
-    candidates/            # Variant prompts generated each cycle
-    history/               # Archived previous versions with scores
-  results/
-    latest_run.json        # Most recent eval results (full details)
-    scores.json            # Historical score tracking
-    failure_analysis.txt   # Your analysis from each cycle
-```
+1. Read the loop instructions from `${CLAUDE_PLUGIN_ROOT}/agents/optimization-loop.md` (skip the YAML frontmatter)
+2. Use the **Agent** tool with:
+   - `prompt`: The loop instructions you just read, followed by any user constraints from $ARGUMENTS (e.g. "target 95% pass rate", "focus on auth category")
+   - `run_in_background`: `false`
+   - Do NOT set `subagent_type` — use the default general-purpose agent
 
-The evaluation runner is available as `autoresearch-runner` (provided by the plugin via `bin/`).
-
-### Setting Bash timeouts
-
-Before every `autoresearch-runner` invocation, run `autoresearch-runner --estimate` (with `--all-candidates` if applicable) to get the recommended timeout. Use that value as the `timeout` parameter on the Bash tool call that runs the actual eval. This prevents long eval runs from being killed mid-execution.
-
-Example:
-1. Run `autoresearch-runner --estimate --all-candidates` — outputs `Recommended timeout: 990000`
-2. Run `autoresearch-runner --all-candidates` with `timeout: 990000`
-
-### Each Cycle
-
-#### 1. Establish baseline (first cycle only)
-
-```bash
-autoresearch-runner --estimate        # get recommended timeout
-autoresearch-runner                   # run with that timeout
-```
-
-#### 2. Analyze failures
-
-Read `.autoresearch/results/latest_run.json` and understand:
-- Which test cases fail and why
-- Which assertions fail most often
-- Are failures clustered by category?
-
-#### 3. Write failure analysis
-
-Write analysis to `.autoresearch/results/failure_analysis.txt`:
-- Top failing assertions with examples
-- Pattern behind failures (e.g., "model omits section X for category Y")
-- Hypothesized fix for each pattern
-
-#### 4. Generate exactly 3 prompt variants
-
-Create 3 files in `.autoresearch/prompts/candidates/`:
-- `v{cycle}a.txt` — Change ONE targeted thing based on top failure
-- `v{cycle}b.txt` — Change ONE different thing based on second failure pattern
-- `v{cycle}c.txt` — Try a structural change (reorder sections, add examples, change emphasis)
-
-Each variant MUST differ from `current.txt` in exactly ONE way so improvements can be attributed.
-
-#### 5. Evaluate all candidates
-
-```bash
-autoresearch-runner --all-candidates
-```
-
-This evaluates `current.txt` and all candidates, printing a comparison.
-
-#### 6. Promote winner (if any)
-
-If a candidate beats the current best:
-1. Copy current to `.autoresearch/prompts/history/v{cycle}_score{rate}.txt`
-2. Copy winning candidate to `.autoresearch/prompts/current.txt`
-3. Clear `.autoresearch/prompts/candidates/`
-
-If no candidate beats current, note what was tried in `.autoresearch/results/failure_analysis.txt`.
-
-#### 7. Repeat
-
-Proceed to the next cycle with the updated prompt.
-
-### Constraints
-
-- **ONE change per variant** — Multi-change variants prevent attribution
-- **Never modify** the assertions or test cases during the loop
-- **Stop** when pass rate exceeds 90% or after 15 cycles
-- **Log every result** — Never delete history
-- If no improvement after 3 consecutive cycles, try a structural change:
-  - Add concrete examples of good/bad output
-  - Reorder instructions to emphasize failing areas
-  - Add explicit "common mistakes" section
+Running in the foreground keeps the user in the loop — they can see progress, approve permissions, and the loop agent can spawn its own parallel subagents for candidate evaluation.

@@ -8,12 +8,38 @@ AutoResearch evaluates a prompt against a test suite, analyzes failures, generat
 
 Each optimization cycle:
 
-1. **Evaluate** — Run the current prompt against all test cases using binary assertions
+1. **Assess** — Run the current prompt against all test cases in parallel using isolated SDK calls and binary assertions
 2. **Analyze** — Identify which assertions fail most and what patterns cause failures
 3. **Generate** — Create 3 candidate variants, each changing exactly ONE thing
-4. **Compare** — Evaluate all candidates against the full test suite
+4. **Compare** — Assess all candidates against the full test suite
 5. **Promote** — If a candidate beats the current best, it becomes the new baseline
 6. **Repeat** — Continue until pass rate exceeds 90% or 15 cycles are exhausted
+
+## Use Cases
+
+### Software Development
+
+- **System prompts for coding assistants** — You have a prompt that helps Claude generate API endpoints, but it keeps forgetting error handling or skips input validation. Write assertions for `assert_has_error_handling`, `assert_validates_input`, `assert_returns_proper_status_codes` and let AutoResearch find the phrasing that makes them stick.
+
+- **Code review prompts** — Your review prompt catches style issues but misses security problems. Create test cases with known vulnerabilities (SQL injection, XSS, hardcoded secrets) and assert that the review flags each one.
+
+- **Test generation prompts** — Your prompt generates unit tests but they're brittle — too coupled to implementation details, missing edge cases, or not testing the actual behavior. Assert that generated tests cover error paths, use meaningful assertions (not just `toBeTruthy`), and avoid mocking internals. Test across different function signatures and complexity levels.
+
+- **Technical documentation generators** — Your prompt produces API docs but inconsistently includes examples, parameter types, or error responses. Assert the structure you need and optimize until every section reliably appears.
+
+- **Migration and upgrade assistants** — A prompt that guides users through framework upgrades (e.g., React 18 to 19). Test across different project structures and assert it identifies breaking changes, suggests the correct replacements, and doesn't hallucinate deprecated APIs.
+
+### Beyond Code
+
+- **Customer support response templates** — Optimize a prompt that drafts support replies. Assert it acknowledges the customer's issue, avoids making promises about timelines, includes relevant help center links, and stays under a word limit.
+
+- **Lesson plan generators** — A teacher's prompt for creating lesson plans. Assert it includes learning objectives, estimated time per activity, materials needed, and differentiation strategies. Test across subjects and grade levels.
+
+- **Recipe adaptation** — A prompt that modifies recipes for dietary restrictions. Assert it removes the right ingredients, suggests appropriate substitutes, and adjusts cooking times. Test across allergies, vegan, keto, etc.
+
+- **Real estate listing descriptions** — Assert the output mentions square footage, number of rooms, neighborhood highlights, and avoids fair housing violations. Test with different property types and price ranges.
+
+- **Meeting summary prompts** — Optimize a prompt that turns meeting transcripts into structured summaries. Assert it captures action items, assigns owners, and notes deadlines. Test with messy, overlapping conversations.
 
 ## Setup
 
@@ -28,6 +54,14 @@ Or for local development:
 ```bash
 claude --plugin-dir /path/to/claude-autoresearch
 ```
+
+### Prerequisites
+
+- Python 3.10+
+- [uv](https://docs.astral.sh/uv/) (for automatic dependency management)
+- An `ANTHROPIC_API_KEY` environment variable (used by the Claude Agent SDK for isolated prompt assessment)
+
+The Agent SDK is installed automatically into `.autoresearch/.venv` on first run.
 
 ### Configure your optimization target
 
@@ -104,7 +138,9 @@ your-project/
       candidates/            # Variant prompts generated each cycle
       history/               # Archived previous versions with scores
     results/
-      latest_run.json        # Detailed results from the most recent run
+      current/               # Per-test-case results for current prompt
+      v1a/                   # Per-test-case results for candidate v1a
+      latest_run.json        # Summarized results from the most recent run
       scores.json            # Historical score tracking
       failure_analysis.txt   # Failure analysis written each cycle
 ```
@@ -123,3 +159,14 @@ your-project/
 - **Vary complexity** — Mix simple and complex inputs
 - **Include edge cases** — Add cases where the prompt is likely to fail
 - **Use realistic inputs** — The closer to real usage, the more useful the optimization
+
+## Non-Determinism
+
+Claude's responses vary between runs, even with identical prompts and inputs. This means pass rates will fluctuate — a prompt scoring 80% on one run might score 70% or 90% on the next.
+
+With a sufficiently large test suite (15+ cases), individual variance tends to average out across the suite, making overall pass rates relatively stable. However, small differences between candidates (e.g., 75% vs 78%) may not be meaningful.
+
+Tips for working with this:
+- **Don't over-index on small margins** — A 2-3% difference could be noise
+- **Use more test cases** — Larger suites produce more stable results
+- **Look at assertion patterns, not just totals** — If a candidate consistently fixes a specific assertion across multiple test cases, that's a real signal even if the overall pass rate is close
