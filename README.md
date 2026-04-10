@@ -138,8 +138,8 @@ your-project/
     results/
       current/               # Per-test-case results for current prompt
       v1a/                   # Per-test-case results for candidate v1a
-      latest_run.json        # Summarized results from the most recent run
-      scores.json            # Historical score tracking
+      summary_current.json   # Summarized results for current prompt
+      scores.json            # Historical score tracking (baseline + promoted winners)
       failure_analysis.txt   # Failure analysis written each cycle
 ```
 

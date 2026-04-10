@@ -25,8 +25,9 @@ All working state lives under `.autoresearch/` in the current working directory.
   results/
     current/               # Per-test-case result files for current prompt
     v1a/                   # Per-test-case result files for candidate v1a
-    latest_run.json        # Most recent summarized results
-    scores.json            # Historical score tracking
+    summary_current.json   # Summarized results for current prompt
+    summary_v1a.json       # Summarized results for candidate v1a (etc.)
+    scores.json            # Historical score tracking (baseline + promoted winners)
     failure_analysis.txt   # Your analysis from each cycle
 ```
 
@@ -55,6 +56,8 @@ autoresearch-runner assess \
   --output .autoresearch/results/<prompt-name>/<test-case-id>.json
 ```
 
+The runner reads `model` from `.autoresearch/config.json` automatically. You can also override per-call with `--model <name>`.
+
 Example — assessing 3 test cases for the current prompt in parallel:
 
 ```
@@ -81,11 +84,15 @@ autoresearch-runner compare .autoresearch/results/summary_current.json .autorese
 
 ### 1. Establish baseline (first cycle only)
 
-Spawn one subagent per test case to assess the current prompt (see above). Then summarize. This is your baseline pass rate.
+Spawn one subagent per test case to assess the current prompt (see above). Then summarize with `--track-score` to record the baseline in scores.json:
+
+```bash
+autoresearch-runner summarize .autoresearch/results/current/ --output .autoresearch/results/summary_current.json --label current --track-score
+```
 
 ### 2. Analyze failures
 
-Read `.autoresearch/results/latest_run.json` and understand:
+Read the summary file for the current prompt (`.autoresearch/results/summary_current.json`) and understand:
 - Which test cases fail and why
 - Which assertions fail most often
 - Are failures clustered by category?
@@ -131,7 +138,11 @@ autoresearch-runner compare .autoresearch/results/summary_current.json .autorese
 If a candidate beats the current best:
 1. Copy current to `.autoresearch/prompts/history/v{cycle}_score{rate}.txt`
 2. Copy winning candidate to `.autoresearch/prompts/current.txt`
-3. Clear `.autoresearch/prompts/candidates/`
+3. Re-summarize the winner with `--track-score` to record it in scores.json:
+   ```bash
+   autoresearch-runner summarize .autoresearch/results/<winner>/ --output .autoresearch/results/summary_<winner>.json --label <winner> --track-score
+   ```
+4. Clear `.autoresearch/prompts/candidates/`
 
 If no candidate beats current, note what was tried in `.autoresearch/results/failure_analysis.txt`.
 

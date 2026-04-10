@@ -3,7 +3,7 @@ name: autoresearch
 description: Iterative prompt optimization loop. Evaluates a prompt against test cases with binary assertions, analyzes failures, generates targeted variants, and promotes winners. Use when optimizing any prompt for higher eval pass rates.
 argument-hint: "[path/to/prompt.txt] [optional goal or constraints]"
 disable-model-invocation: true
-allowed-tools: Bash(autoresearch-runner*) Bash(cp *) Bash(rm *) Bash(mv *) Bash(mkdir *) Bash(git *) Agent Read Write Edit Glob Grep AskUserQuestion
+allowed-tools: Bash(autoresearch-runner*) Bash(cp *) Bash(rm .autoresearch/*) Bash(mv .autoresearch/*) Bash(mkdir *) Bash(git *) Agent Read Write Edit Glob Grep AskUserQuestion
 ---
 
 # AutoResearch: Prompt Optimization
@@ -115,9 +115,12 @@ Write `.autoresearch/config.json` with the resolved paths:
 {
   "prompt": "<path to source prompt>",
   "assertions": "<path to assertions file>",
-  "test_cases": "<path to test cases file>"
+  "test_cases": "<path to test cases file>",
+  "model": "sonnet"
 }
 ```
+
+The `model` field is optional (defaults to `"sonnet"`). If the user specified a target model, set it here.
 
 ## Phase 2: Launch Optimization Loop
 

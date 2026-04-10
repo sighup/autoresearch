@@ -207,7 +207,8 @@ def cmd_assess(prompt_path: str, test_case_id: str, assertions_path: str,
 # summarize — aggregate per-test-case results into a run summary
 # ---------------------------------------------------------------------------
 
-def cmd_summarize(results_dir: str, output_path: str | None, prompt_label: str | None):
+def cmd_summarize(results_dir: str, output_path: str | None, prompt_label: str | None,
+                   track_score: bool = False):
     """Aggregate individual test case results into a run summary."""
     results_path = Path(results_dir)
     if not results_path.is_dir():
@@ -221,14 +222,17 @@ def cmd_summarize(results_dir: str, output_path: str | None, prompt_label: str |
 
     results = []
     passed = 0
-    total = len(result_files)
+    skipped = 0
     all_assertion_names = set()
 
-    print(f"Summarizing {total} results from: {results_dir}")
+    print(f"Summarizing results from: {results_dir}")
     print("-" * 60)
 
     for f in result_files:
         r = json.loads(f.read_text())
+        if "id" not in r or "assertions" not in r:
+            skipped += 1
+            continue
         results.append(r)
         all_assertion_names.update(r.get("assertions", {}).keys())
         if r["passed"]:
@@ -236,6 +240,14 @@ def cmd_summarize(results_dir: str, output_path: str | None, prompt_label: str |
             print(f"  {r['id']}: PASS")
         else:
             print(f"  {r['id']}: FAIL [{', '.join(r.get('failed', []))}]")
+
+    if skipped:
+        print(f"  (skipped {skipped} non-result file(s))")
+
+    total = len(results)
+    if total == 0:
+        print(f"ERROR: No valid test-case results in {results_dir}", file=sys.stderr)
+        sys.exit(1)
 
     pass_rate = passed / total if total > 0 else 0
 
@@ -286,16 +298,17 @@ def cmd_summarize(results_dir: str, output_path: str | None, prompt_label: str |
     Path(dest).write_text(json.dumps(run_result, indent=2))
     print(f"\nResults written to: {dest}")
 
-    # Append to scores history
-    scores_path = Path(SCORES_FILE)
-    scores = json.loads(scores_path.read_text()) if scores_path.exists() else []
-    scores.append({
-        "prompt": prompt_label or results_dir,
-        "timestamp": run_result["timestamp"],
-        "pass_rate": run_result["pass_rate"],
-        "assertion_pass_rates": assertion_rates,
-    })
-    scores_path.write_text(json.dumps(scores, indent=2))
+    # Append to scores history (only when explicitly requested, e.g. on promotion)
+    if track_score:
+        scores_path = Path(SCORES_FILE)
+        scores = json.loads(scores_path.read_text()) if scores_path.exists() else []
+        scores.append({
+            "prompt": prompt_label or results_dir,
+            "timestamp": run_result["timestamp"],
+            "pass_rate": run_result["pass_rate"],
+            "assertion_pass_rates": assertion_rates,
+        })
+        scores_path.write_text(json.dumps(scores, indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -314,12 +327,22 @@ def cmd_compare(*result_files: str):
     print("COMPARISON SUMMARY")
     print("=" * 60)
     rates.sort(key=lambda x: x[1], reverse=True)
+    top_rate = rates[0][1]
+    tied_at_top = sum(1 for _, r in rates if r == top_rate)
     for name, rate in rates:
-        marker = " <-- BEST" if rate == rates[0][1] else ""
+        if rate == top_rate and tied_at_top == 1:
+            marker = " <-- BEST"
+        elif rate == top_rate and tied_at_top > 1:
+            marker = " <-- TIED"
+        else:
+            marker = ""
         print(f"  {name:30s} {rate:.1%}{marker}")
 
     best_name, best_rate = rates[0]
-    if len(rates) > 1 and best_rate > rates[-1][1]:
+    if tied_at_top > 1:
+        tied_names = [n for n, r in rates if r == top_rate]
+        print(f"\nTied at {best_rate:.1%}: {', '.join(tied_names)}")
+    elif len(rates) > 1 and best_rate > rates[-1][1]:
         print(f"\nBest: '{best_name}' at {best_rate:.1%}")
     print("=" * 60)
 
@@ -342,7 +365,7 @@ def main():
         prompt_path = None
         test_case_id = None
         output_path = None
-        model = "sonnet"
+        model = config.get("model", "sonnet")
         i = 2
         while i < len(sys.argv):
             if sys.argv[i] == "--prompt":
@@ -374,15 +397,19 @@ def main():
         results_dir = sys.argv[2]
         output_path = None
         label = None
+        track_score = False
         i = 3
         while i < len(sys.argv):
             if sys.argv[i] == "--output":
                 output_path = sys.argv[i + 1]; i += 2
             elif sys.argv[i] == "--label":
                 label = sys.argv[i + 1]; i += 2
+            elif sys.argv[i] == "--track-score":
+                track_score = True; i += 1
             else:
-                i += 1
-        cmd_summarize(results_dir, output_path, label)
+                print(f"Unknown flag: {sys.argv[i]}", file=sys.stderr)
+                sys.exit(1)
+        cmd_summarize(results_dir, output_path, label, track_score)
 
     elif command == "compare":
         if len(sys.argv) < 4:
