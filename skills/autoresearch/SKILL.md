@@ -1,14 +1,14 @@
 ---
 name: autoresearch
-description: Iterative prompt optimization loop. Evaluates a prompt against test cases with binary assertions, analyzes failures, generates targeted variants, and promotes winners. Use when optimizing any prompt for higher eval pass rates.
-argument-hint: "[path/to/prompt.txt] [optional goal or constraints]"
+description: Iterative optimization loop. Evaluates an artifact (prompt, code, config) against test cases with binary assertions, analyzes failures, generates targeted variants, and promotes winners. Use when optimizing any artifact for higher eval pass rates.
+argument-hint: "[path/to/artifact | find | clean] [optional goal or constraints]"
 disable-model-invocation: true
 allowed-tools: Bash(autoresearch-runner*) Bash(cp *) Bash(rm .autoresearch/*) Bash(mv .autoresearch/*) Bash(mkdir *) Bash(git *) Agent Read Write Edit Glob Grep AskUserQuestion
 ---
 
-# AutoResearch: Prompt Optimization
+# AutoResearch: Iterative Optimization
 
-You help users set up and run iterative prompt optimization.
+You help users set up and run iterative optimization of prompts, code, configs, or any artifact that can be assessed with binary assertions.
 
 User arguments: $ARGUMENTS
 
@@ -27,6 +27,32 @@ If the user's argument is "clean" or "cleanup" (e.g. `/autoresearch clean`), ski
 
 After cleanup, confirm what was removed.
 
+## Discovery mode
+
+If the user's argument is "find", "scout", or "discover" (e.g. `/autoresearch find`), skip Phase 1 and help them find candidates in their repo.
+
+1. Read `${CLAUDE_PLUGIN_ROOT}/skills/autoresearch/references/candidates.md` for the discovery heuristics.
+2. Scan the repo using those heuristics:
+   - Use Glob for file pattern matches (prompts, configs, CI files)
+   - Use Grep for inline prompt detection and slowness signals
+   - Check for existing eval infrastructure
+3. Rank candidates by setup effort (easy first) and signal strength. Cap at 5-8 results.
+4. Present findings in this format:
+
+> I found [N] candidates in this repo. Ranked by how easy they'd be to start:
+>
+> **1. [Name]** — `[path]`
+>    - Type: [prompt / performance / quality / LLM integration]
+>    - Signal: [one-line reason]
+>    - Setup: [easy (prompt mode) / medium (custom runner)]
+>    - Start with: `/autoresearch [path]`
+>
+> **2. [Name]** ...
+>
+> Which one do you want to pursue? I can either start the setup now, or you can run `/autoresearch <path>` later.
+
+5. If the user picks one, proceed to Phase 1 with that artifact. Otherwise, end — they can come back when ready.
+
 ## Resume mode
 
 If `.autoresearch/config.json` already exists and the user didn't pass "clean", the setup is already done. Skip to Phase 2 to launch the optimization loop.
@@ -35,25 +61,44 @@ If `.autoresearch/config.json` already exists and the user didn't pass "clean", 
 
 Walk the user through setup interactively. Check what exists, ask about what's missing, and help them build what they need.
 
-### Step 1: Identify the prompt
+### Step 1: Identify the artifact
 
 1. If the user passed a file path as the first argument (e.g. `/autoresearch src/prompts/summarizer.txt`), use that file.
-2. Otherwise, check if `.autoresearch/config.json` has a `"prompt"` field and use that.
+2. Otherwise, check if `.autoresearch/config.json` has an `"artifact"` or `"prompt"` field and use that.
 3. If neither, ask the user:
 
-> What prompt do you want to optimize? Give me a file path, or describe what it does and I'll help you find it.
+> What do you want to optimize? This can be a prompt file, code, config, or any artifact. Give me a file path, or describe what it does and I'll help you find it.
 
-Read the prompt file once identified. You need to understand what it does to help with assertions and test cases.
+Read the artifact once identified. You need to understand what it does to help with assertions and test cases.
+
+### Step 1b: Determine if a custom runner is needed
+
+If the artifact is a **prompt file** (text that will be used as a system prompt for Claude), no custom runner is needed — the built-in SDK assessment works directly.
+
+If the artifact is **anything else** (code, config, scripts), you need a custom runner — a shell command that takes the artifact, runs it or applies it, and produces output for assertions to grade. Ask the user:
+
+> This looks like [code/config/etc.], not a prompt. To assess it, I need a command that runs or applies it and produces measurable output.
+>
+> For example, if you're optimizing test performance, the runner might be `bash run_tests.sh` which runs the test suite and reports timing.
+>
+> What command should I use to assess each variant? It will receive these environment variables:
+> - `AUTORESEARCH_ARTIFACT` — path to the artifact
+> - `AUTORESEARCH_TEST_ID` — which test case is being run
+> - `AUTORESEARCH_TEST_INPUT` — the test case input text
+>
+> Its stdout becomes the text that assertions check.
+
+If the user needs help writing the runner script, help them create one. Read `${CLAUDE_PLUGIN_ROOT}/skills/autoresearch/references/custom_runner_example.sh` for the expected contract.
 
 ### Step 2: Identify or create assertions
 
 Check `.autoresearch/config.json` for an `"assertions"` path, then fall back to `.autoresearch/assertions.py`.
 
-If no assertions file exists, guide the user through creating one. Read the prompt file and ask:
+If no assertions file exists, guide the user through creating one. Read the artifact and ask:
 
-> I've read your prompt. To optimize it, I need to know what "good output" looks like. Here's what I noticed about the prompt's expected output:
+> I've read your [prompt/code/config]. To optimize it, I need to know what "good output" looks like. Here's what I noticed:
 >
-> - [list 3-5 structural properties you observed, e.g. "It should produce markdown with specific sections", "It includes a summary block at the end", "Output should contain code examples"]
+> - [list 3-5 properties you observed, e.g. "It should produce markdown with specific sections", "Tests should all pass", "Execution time should be under a threshold"]
 >
 > Which of these matter most? Are there other properties you want to enforce? I'll turn these into assertions — binary pass/fail checks that each test case must satisfy.
 
@@ -89,7 +134,8 @@ Aim for 10-20 test cases across 3-5 categories. Fewer test cases means faster cy
 Summarize the setup for the user:
 
 > Here's what I've set up:
-> - **Prompt**: [path] — [brief description of what it does]
+> - **Artifact**: [path] — [brief description of what it does]
+> - **Runner**: [built-in SDK / custom command]
 > - **Assertions**: [count] checks — [list names]
 > - **Test cases**: [count] cases across [count] categories — [list categories]
 >
@@ -99,28 +145,38 @@ Wait for confirmation before proceeding.
 
 Then initialize `.autoresearch/`:
 
+**Prompt mode** (no custom runner):
+
 ```bash
 mkdir -p .autoresearch/prompts/candidates .autoresearch/prompts/history .autoresearch/results
-```
-
-Copy the source prompt to the working location:
-
-```bash
 cp <source-prompt> .autoresearch/prompts/current.txt
 ```
 
-Write `.autoresearch/config.json` with the resolved paths:
-
 ```json
 {
-  "prompt": "<path to source prompt>",
+  "artifact": "<path to source prompt>",
   "assertions": "<path to assertions file>",
   "test_cases": "<path to test cases file>",
   "model": "sonnet"
 }
 ```
 
-The `model` field is optional (defaults to `"sonnet"`). If the user specified a target model, set it here.
+**Custom runner mode**:
+
+```bash
+mkdir -p .autoresearch/history .autoresearch/results
+```
+
+```json
+{
+  "artifact": "<path to artifact being optimized>",
+  "runner": "<shell command to run assessment>",
+  "assertions": "<path to assertions file>",
+  "test_cases": "<path to test cases file>"
+}
+```
+
+The `model` field is optional (defaults to `"sonnet"`, only used in prompt mode). The `runner` field triggers custom runner mode.
 
 ## Phase 2: Launch Optimization Loop
 

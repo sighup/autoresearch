@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """AutoResearch assessment runner.
 
-Assesses prompts against test cases using the Claude Agent SDK for isolated
-API calls and Python assertion functions for deterministic grading.
+Assesses artifacts against test cases using either the Claude Agent SDK
+(default) or a custom runner command, then grades with assertion functions.
 
 Commands:
-    autoresearch-runner assess --prompt P --test-case TC [--output FILE]
+    autoresearch-runner assess --artifact P --test-case TC [--output FILE]
     autoresearch-runner summarize <results-dir> [--output FILE]
     autoresearch-runner compare <result1.json> <result2.json> ...
 """
@@ -112,25 +112,18 @@ def load_test_case(test_cases_path: str, test_case_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# assess — one SDK call + assertions for one test case
+# assess — get response (SDK or custom runner) + grade with assertions
 # ---------------------------------------------------------------------------
 
-def cmd_assess(prompt_path: str, test_case_id: str, assertions_path: str,
-               test_cases_path: str, output_path: str | None, model: str):
-    """Assess a single test case: isolated SDK call, then grade with assertions."""
+def _run_sdk(artifact_path: str, case: dict, model: str) -> str:
+    """Get a response via an isolated Claude Agent SDK call."""
     import asyncio
 
     _ensure_venv()
     from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
 
-    prompt = Path(prompt_path).read_text()
-    case = load_test_case(test_cases_path, test_case_id)
-    assertions = load_assertions(assertions_path)
+    prompt = Path(artifact_path).read_text()
 
-    print(f"Assessing: {test_case_id} (prompt: {prompt_path})", flush=True)
-    start = time.time()
-
-    # --- Isolated SDK call ---
     async def get_response() -> str:
         result_text = ""
         async for message in query(
@@ -148,8 +141,46 @@ def cmd_assess(prompt_path: str, test_case_id: str, assertions_path: str,
                 result_text = message.result or ""
         return result_text
 
+    return asyncio.run(get_response())
+
+
+def _run_custom(runner_cmd: str, artifact_path: str, case: dict) -> str:
+    """Get a response by running a custom command.
+
+    The command receives context via environment variables:
+        AUTORESEARCH_ARTIFACT  — path to the artifact being optimized
+        AUTORESEARCH_TEST_ID   — test case ID
+        AUTORESEARCH_TEST_INPUT — test case input text
+
+    stdout is captured as the response text.
+    """
+    env = {**os.environ,
+           "AUTORESEARCH_ARTIFACT": artifact_path,
+           "AUTORESEARCH_TEST_ID": case["id"],
+           "AUTORESEARCH_TEST_INPUT": case["input"]}
+    proc = _sp.run(runner_cmd, shell=True, capture_output=True, text=True, env=env)
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip()
+        raise RuntimeError(f"Runner exited {proc.returncode}: {stderr}")
+    return proc.stdout
+
+
+def cmd_assess(artifact_path: str, test_case_id: str, assertions_path: str,
+               test_cases_path: str, output_path: str | None, model: str,
+               runner_cmd: str | None):
+    """Assess a single test case: get response, then grade with assertions."""
+    case = load_test_case(test_cases_path, test_case_id)
+    assertions = load_assertions(assertions_path)
+
+    mode = "custom" if runner_cmd else "sdk"
+    print(f"Assessing: {test_case_id} (artifact: {artifact_path}, mode: {mode})", flush=True)
+    start = time.time()
+
     try:
-        output = asyncio.run(get_response())
+        if runner_cmd:
+            output = _run_custom(runner_cmd, artifact_path, case)
+        else:
+            output = _run_sdk(artifact_path, case, model)
         elapsed = time.time() - start
 
         # --- Run assertions ---
@@ -362,20 +393,23 @@ def main():
     test_cases_path = config.get("test_cases", f"{AUTORESEARCH_DIR}/test_cases.jsonl")
 
     if command == "assess":
-        prompt_path = None
+        artifact_path = None
         test_case_id = None
         output_path = None
         model = config.get("model", "sonnet")
+        runner_cmd = config.get("runner")
         i = 2
         while i < len(sys.argv):
-            if sys.argv[i] == "--prompt":
-                prompt_path = sys.argv[i + 1]; i += 2
+            if sys.argv[i] in ("--prompt", "--artifact"):
+                artifact_path = sys.argv[i + 1]; i += 2
             elif sys.argv[i] == "--test-case":
                 test_case_id = sys.argv[i + 1]; i += 2
             elif sys.argv[i] == "--output":
                 output_path = sys.argv[i + 1]; i += 2
             elif sys.argv[i] == "--model":
                 model = sys.argv[i + 1]; i += 2
+            elif sys.argv[i] == "--runner":
+                runner_cmd = sys.argv[i + 1]; i += 2
             elif sys.argv[i] == "--assertions":
                 assertions_path = sys.argv[i + 1]; i += 2
             elif sys.argv[i] == "--test-cases":
@@ -384,11 +418,14 @@ def main():
                 print(f"Unknown flag: {sys.argv[i]}", file=sys.stderr)
                 sys.exit(1)
 
-        if not prompt_path or not test_case_id:
-            print("Usage: autoresearch-runner assess --prompt <file> --test-case <id> [--output <file>]", file=sys.stderr)
+        if not artifact_path:
+            # Fall back to config
+            artifact_path = config.get("artifact") or config.get("prompt")
+        if not artifact_path or not test_case_id:
+            print("Usage: autoresearch-runner assess --artifact <file> --test-case <id> [--output <file>]", file=sys.stderr)
             sys.exit(1)
 
-        cmd_assess(prompt_path, test_case_id, assertions_path, test_cases_path, output_path, model)
+        cmd_assess(artifact_path, test_case_id, assertions_path, test_cases_path, output_path, model, runner_cmd)
 
     elif command == "summarize":
         if len(sys.argv) < 3:

@@ -1,14 +1,14 @@
 # AutoResearch
 
-A Claude Code plugin for iterative prompt optimization through automated red-teaming.
+A Claude Code plugin for iterative optimization through automated red-teaming.
 
-AutoResearch evaluates a prompt against a test suite, analyzes failures, generates targeted variants, and promotes winners — repeating until the prompt hits your target pass rate.
+AutoResearch evaluates an artifact (prompt, code, config, or anything else) against a test suite, analyzes failures, generates targeted variants, and promotes winners — repeating until it hits your target pass rate.
 
 ## How It Works
 
 Each optimization cycle:
 
-1. **Assess** — Run the current prompt against all test cases in parallel using isolated SDK calls and binary assertions
+1. **Assess** — Run the current artifact against all test cases using binary assertions
 2. **Analyze** — Identify which assertions fail most and what patterns cause failures
 3. **Generate** — Create 3 candidate variants, each changing exactly ONE thing
 4. **Compare** — Assess all candidates against the full test suite
@@ -41,6 +41,16 @@ Each optimization cycle:
 
 - **Meeting summary prompts** — Optimize a prompt that turns meeting transcripts into structured summaries. Assert it captures action items, assigns owners, and notes deadlines. Test with messy, overlapping conversations.
 
+### Beyond Prompts (Custom Runners)
+
+AutoResearch can optimize any artifact, not just prompts. Provide a custom runner command that knows how to assess your artifact, and assertions grade its output.
+
+- **Test suite performance** — Your unit tests take 10 minutes and you want them under 8. The runner executes the test suite and reports timing; assertions check `assert_all_tests_pass` and `assert_under_target_time`. The loop agent tries parallelization, fixture scoping, test ordering, and other optimizations.
+
+- **Build configuration** — Your build takes too long or produces oversized bundles. The runner runs the build and reports size/time; assertions enforce thresholds.
+
+- **Database queries** — A slow query needs optimization. The runner executes the query and reports execution time and row counts; assertions check performance targets and result correctness.
+
 ## Setup
 
 ### Install the plugin
@@ -59,17 +69,17 @@ claude --plugin-dir /path/to/claude-autoresearch
 
 - Python 3.10+
 - [uv](https://docs.astral.sh/uv/) (for automatic dependency management)
-- An `ANTHROPIC_API_KEY` environment variable (used by the Claude Agent SDK for isolated prompt assessment)
+- An `ANTHROPIC_API_KEY` environment variable (only required for prompt mode — not needed when using a custom runner)
 
-The Agent SDK is installed automatically into `.autoresearch/.venv` on first run.
+The Agent SDK is installed automatically into `.autoresearch/.venv` on first run when using prompt mode.
 
 ### Configure your optimization target
 
-You need three things:
+You need three things (and optionally a fourth):
 
-#### 1. A prompt file
+#### 1. An artifact
 
-Any text file containing the prompt you want to optimize. It can live anywhere in your project.
+The thing you want to optimize — a prompt file, source code, config, or any file. It can live anywhere in your project.
 
 #### 2. Test cases
 
@@ -82,7 +92,7 @@ A JSONL file with one test case per line. Each line is a JSON object with `id`, 
 
 #### 3. Assertions
 
-A Python file defining binary assertion functions. Each function takes the model's full response as a string and returns `True` or `False`. Register them in an `ASSERTIONS` list:
+A Python file defining binary assertion functions. Each function takes the runner's output as a string and returns `True` or `False`. Register them in an `ASSERTIONS` list:
 
 ```python
 import re
@@ -101,22 +111,48 @@ ASSERTIONS = [
 ]
 ```
 
-These files can live anywhere in your project. You can either place them directly in `.autoresearch/` or point to them from `.autoresearch/config.json`:
+#### 4. A custom runner (optional)
+
+For non-prompt artifacts, provide a shell command that assesses your artifact. It receives context via environment variables:
+
+- `AUTORESEARCH_ARTIFACT` — path to the artifact being optimized
+- `AUTORESEARCH_TEST_ID` — test case ID
+- `AUTORESEARCH_TEST_INPUT` — test case input text
+
+Its stdout becomes the response text that assertions grade. Exit 0 on success; non-zero is treated as an error.
+
+These files can live anywhere in your project. Point to them from `.autoresearch/config.json`:
+
+**Prompt mode** (default):
 
 ```json
 {
-  "prompt": "src/prompts/summarizer.txt",
+  "artifact": "src/prompts/summarizer.txt",
   "assertions": "tests/summarizer_assertions.py",
   "test_cases": "tests/summarizer_cases.jsonl"
+}
+```
+
+**Custom runner mode**:
+
+```json
+{
+  "artifact": "pytest.ini",
+  "runner": "bash ./run_tests_timed.sh",
+  "assertions": "tests/perf_assertions.py",
+  "test_cases": "tests/perf_cases.jsonl"
 }
 ```
 
 ## Usage
 
 ```
-/autoresearch                                        # asks for prompt path
-/autoresearch src/prompts/summarizer.txt             # optimize this file
+/autoresearch                                        # asks for artifact path
+/autoresearch find                                   # scan repo for candidates
+/autoresearch src/prompts/summarizer.txt             # optimize this prompt
 /autoresearch src/prompts/summarizer.txt target 95%  # with a goal
+/autoresearch pytest.ini                             # optimize non-prompt (will ask for runner)
+/autoresearch clean                                  # clean up .autoresearch/
 ```
 
 Claude will set up `.autoresearch/`, establish a baseline, then iterate through cycles of analysis, variant generation, and evaluation. All working state stays inside `.autoresearch/`.
@@ -128,17 +164,18 @@ The plugin keeps all its working state in a single directory:
 ```
 your-project/
   .autoresearch/
-    config.json              # Points to source prompt, assertions, test cases
+    config.json              # Points to artifact, assertions, test cases, optional runner
     assertions.py            # Assertions (if not located elsewhere)
     test_cases.jsonl         # Test cases (if not located elsewhere)
-    prompts/
+    prompts/                 # (prompt mode only)
       current.txt            # Working copy of the prompt
       candidates/            # Variant prompts generated each cycle
       history/               # Archived previous versions with scores
+    history/                 # (custom runner mode) archived artifact snapshots
     results/
-      current/               # Per-test-case results for current prompt
+      current/               # Per-test-case results for current artifact
       v1a/                   # Per-test-case results for candidate v1a
-      summary_current.json   # Summarized results for current prompt
+      summary_current.json   # Summarized results for current artifact
       scores.json            # Historical score tracking (baseline + promoted winners)
       failure_analysis.txt   # Failure analysis written each cycle
 ```
@@ -160,7 +197,7 @@ your-project/
 
 ## Non-Determinism
 
-Claude's responses vary between runs, even with identical prompts and inputs. This means pass rates will fluctuate — a prompt scoring 80% on one run might score 70% or 90% on the next.
+In prompt mode, Claude's responses vary between runs, even with identical prompts and inputs. This means pass rates will fluctuate — a prompt scoring 80% on one run might score 70% or 90% on the next.
 
 With a sufficiently large test suite (15+ cases), individual variance tends to average out across the suite, making overall pass rates relatively stable. However, small differences between candidates (e.g., 75% vs 78%) may not be meaningful.
 
@@ -168,3 +205,5 @@ Tips for working with this:
 - **Don't over-index on small margins** — A 2-3% difference could be noise
 - **Use more test cases** — Larger suites produce more stable results
 - **Look at assertion patterns, not just totals** — If a candidate consistently fixes a specific assertion across multiple test cases, that's a real signal even if the overall pass rate is close
+
+In custom runner mode, results may be more deterministic (e.g., test execution time is measurable), but external factors (system load, caching) can still introduce variance.
