@@ -1,0 +1,19 @@
+{
+  "name": "autoresearch",
+  "owner": {
+    "name": "sighup",
+    "url": "https://github.com/sighup"
+  },
+  "metadata": {
+    "description": "Iterative prompt optimization through automated red-teaming",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "autoresearch",
+      "description": "Iterative prompt optimization through automated red-teaming. Evaluates prompts against test cases, analyzes failures, generates targeted variants, and promotes winners.",
+      "source": "./",
+      "strict": true
+    }
+  ]
+}

@@ -55,14 +55,18 @@ AutoResearch can optimize any artifact, not just prompts. Provide a custom runne
 
 ### Install the plugin
 
-```bash
-claude plugin install autoresearch --scope user
+In Claude Code, add this repo as a plugin marketplace, then install:
+
+```
+/plugin marketplace add sighup/autoresearch
+/plugin install autoresearch@autoresearch
 ```
 
-Or for local development:
+For local development, point Claude Code at your clone:
 
-```bash
-claude --plugin-dir /path/to/claude-autoresearch
+```
+/plugin marketplace add /path/to/autoresearch
+/plugin install autoresearch@autoresearch
 ```
 
 ### Prerequisites
