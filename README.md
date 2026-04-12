@@ -1,6 +1,6 @@
 # AutoResearch
 
-A Claude Code plugin for iterative optimization through automated red-teaming.
+A Claude Code plugin for iterative optimization through automated evaluation.
 
 AutoResearch evaluates an artifact (prompt, code, config, or anything else) against a test suite, analyzes failures, generates targeted variants, and promotes winners — repeating until it hits your target pass rate.
 

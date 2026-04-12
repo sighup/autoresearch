@@ -5,13 +5,13 @@
     "url": "https://github.com/sighup"
   },
   "metadata": {
-    "description": "Iterative prompt optimization through automated red-teaming",
+    "description": "Iterative optimization through automated evaluation",
     "version": "0.1.0"
   },
   "plugins": [
     {
       "name": "autoresearch",
-      "description": "Iterative prompt optimization through automated red-teaming. Evaluates prompts against test cases, analyzes failures, generates targeted variants, and promotes winners.",
+      "description": "Iterative optimization through automated evaluation. Evaluates artifacts against test cases, analyzes failures, generates targeted variants, and promotes winners.",
       "source": "./",
       "strict": true
     }
