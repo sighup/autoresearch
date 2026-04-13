@@ -217,7 +217,34 @@ If a candidate beats the current best:
 
 If no candidate beats current, note what was tried in `.autoresearch/results/failure_analysis.txt`.
 
-### 7. Repeat
+### 7. Report
+
+After promoting (or deciding not to promote), output a brief text summary. This is required — do not skip this step.
+
+```
+## Cycle N Results
+
+| Variant | Pass Rate | vs Current |
+|---------|-----------|------------|
+| current | 72%       | —          |
+| vNa     | 68%       | -4%        |
+| vNb     | 78%       | +6%        |
+| vNc     | 71%       | -1%        |
+
+**Winner:** vNb (78%) — <one-line description of what changed>
+**Trajectory:** 65% → 68% → 72% → 78%
+```
+
+If no candidate improved:
+```
+## Cycle N Results
+
+No improvement. Best candidate: vNa (71%) vs current (72%).
+Tried: <brief summary of the 3 changes attempted>
+**Trajectory:** 65% → 68% → 72% (unchanged)
+```
+
+### 8. Repeat
 
 Mark the current cycle task completed with the outcome, then create the next cycle's task:
 ```
