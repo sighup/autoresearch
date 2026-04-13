@@ -89,6 +89,8 @@ For non-prompt artifacts, provide a shell command that assesses your artifact. I
 
 Its stdout becomes the response text that assertions grade. Exit 0 on success; non-zero is treated as an error.
 
+**Concurrency requirement**: Your runner may be invoked concurrently for different test cases (one subprocess per test case, running simultaneously). Use the `AUTORESEARCH_TEST_ID` environment variable to isolate per-run state — write to test-specific temp directories, use separate database transactions, etc. If your runner cannot handle concurrent invocation, set `"parallel": false` in your config (see below).
+
 These files can live anywhere in your project. Point to them from `.autoresearch/config.json`:
 
 **Prompt mode** (default):
@@ -107,6 +109,18 @@ These files can live anywhere in your project. Point to them from `.autoresearch
 {
   "artifact": "pytest.ini",
   "runner": "bash ./run_tests_timed.sh",
+  "assertions": "tests/perf_assertions.py",
+  "test_cases": "tests/perf_cases.jsonl"
+}
+```
+
+**Parallelism**: Test cases within a variant are assessed concurrently by default in prompt mode, and sequentially in custom runner mode. Override this with the `"parallel"` config field:
+
+```json
+{
+  "artifact": "pytest.ini",
+  "runner": "bash ./run_tests_timed.sh",
+  "parallel": true,
   "assertions": "tests/perf_assertions.py",
   "test_cases": "tests/perf_cases.jsonl"
 }

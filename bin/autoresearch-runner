@@ -6,10 +6,12 @@ Assesses artifacts against test cases using either the Claude Agent SDK
 
 Commands:
     autoresearch-runner assess --artifact P --test-case TC [--output FILE]
+    autoresearch-runner batch-assess --variant name:path [--variant ...] [--track-baseline]
     autoresearch-runner summarize <results-dir> [--output FILE]
     autoresearch-runner compare <result1.json> <result2.json> ...
 """
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -109,6 +111,15 @@ def load_test_case(test_cases_path: str, test_case_id: str) -> dict:
             return case
     print(f"ERROR: Test case '{test_case_id}' not found in {test_cases_path}", file=sys.stderr)
     sys.exit(1)
+
+
+def load_all_test_cases(test_cases_path: str) -> list[dict]:
+    """Load all test cases from a JSONL file."""
+    cases = []
+    for line in Path(test_cases_path).read_text().strip().split("\n"):
+        if line.strip():
+            cases.append(json.loads(line))
+    return cases
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +393,228 @@ def cmd_compare(*result_files: str):
 
 
 # ---------------------------------------------------------------------------
+# batch-assess — assess all test cases for multiple variants in one process
+# ---------------------------------------------------------------------------
+
+_MAX_PARALLEL = 10  # limit concurrent assessments to avoid overwhelming APIs
+
+
+async def _assess_one_async(variant_name: str, artifact_path: str, case: dict,
+                            assertions: list, model: str, runner_cmd: str | None,
+                            sem: asyncio.Semaphore) -> dict:
+    """Assess a single test case asynchronously."""
+    async with sem:
+        start = time.time()
+        try:
+            if runner_cmd:
+                env = {**os.environ,
+                       "AUTORESEARCH_ARTIFACT": artifact_path,
+                       "AUTORESEARCH_TEST_ID": case["id"],
+                       "AUTORESEARCH_TEST_INPUT": case["input"]}
+                proc = await asyncio.create_subprocess_shell(
+                    runner_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                )
+                stdout, stderr = await proc.communicate()
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"Runner exited {proc.returncode}: {stderr.decode().strip()}")
+                output = stdout.decode()
+            else:
+                from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
+                prompt = Path(artifact_path).read_text()
+                output = ""
+                async for message in query(
+                    prompt=case["input"],
+                    options=ClaudeAgentOptions(
+                        system_prompt=prompt,
+                        model=model,
+                        max_turns=1,
+                        permission_mode="dontAsk",
+                        tools=[],
+                        setting_sources=[],
+                        plugins=[],
+                    ),
+                ):
+                    if isinstance(message, ResultMessage):
+                        if message.is_error:
+                            raise RuntimeError(f"SDK error: {message.result}")
+                        output = message.result or ""
+
+            elapsed = time.time() - start
+
+            assertion_results = {}
+            for fn in assertions:
+                try:
+                    assertion_results[fn.__name__] = fn(output)
+                except Exception as e:
+                    assertion_results[fn.__name__] = False
+                    print(f"  WARNING: {fn.__name__} raised {e}", file=sys.stderr)
+
+            case_passed = all(assertion_results.values())
+            failed = [k for k, v in assertion_results.items() if not v]
+
+            status = "PASS" if case_passed else f"FAIL [{', '.join(failed)}]"
+            print(f"  {variant_name}/{case['id']}: {status} ({elapsed:.1f}s)", flush=True)
+
+            return {
+                "id": case["id"],
+                "category": case.get("category", "unknown"),
+                "passed": case_passed,
+                "assertions": assertion_results,
+                "failed": failed,
+                "output": output,
+                "output_length": len(output),
+                "elapsed_seconds": round(elapsed, 1),
+            }
+        except Exception as e:
+            elapsed = time.time() - start
+            print(f"  {variant_name}/{case['id']}: ERROR ({elapsed:.1f}s): {e}",
+                  file=sys.stderr, flush=True)
+            return {
+                "id": case["id"],
+                "category": case.get("category", "unknown"),
+                "passed": False,
+                "assertions": {},
+                "failed": ["error"],
+                "error": str(e),
+                "output": "",
+                "output_length": 0,
+                "elapsed_seconds": round(elapsed, 1),
+            }
+
+
+def _summarize_results(variant_name: str, results: list[dict],
+                       track_score: bool = False) -> dict:
+    """Summarize a list of result dicts into a run summary. Returns the summary."""
+    passed = sum(1 for r in results if r["passed"])
+    total = len(results)
+    pass_rate = passed / total if total > 0 else 0
+
+    all_assertion_names = set()
+    for r in results:
+        all_assertion_names.update(r.get("assertions", {}).keys())
+
+    assertion_rates = {}
+    for name in sorted(all_assertion_names):
+        ap = sum(1 for r in results if r.get("assertions", {}).get(name, False))
+        assertion_rates[name] = round(ap / total, 3) if total > 0 else 0
+
+    categories = {}
+    for r in results:
+        cat = r.get("category", "unknown")
+        if cat not in categories:
+            categories[cat] = {"passed": 0, "total": 0}
+        categories[cat]["total"] += 1
+        if r["passed"]:
+            categories[cat]["passed"] += 1
+
+    summary = {
+        "prompt": variant_name,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "pass_rate": round(pass_rate, 3),
+        "passed": passed,
+        "total": total,
+        "assertion_pass_rates": assertion_rates,
+        "category_breakdown": categories,
+        "results": results,
+    }
+
+    summary_path = Path(RESULTS_DIR) / f"summary_{variant_name}.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(json.dumps(summary, indent=2))
+
+    if track_score:
+        scores_path = Path(SCORES_FILE)
+        scores = json.loads(scores_path.read_text()) if scores_path.exists() else []
+        scores.append({
+            "prompt": variant_name,
+            "timestamp": summary["timestamp"],
+            "pass_rate": summary["pass_rate"],
+            "assertion_pass_rates": assertion_rates,
+        })
+        scores_path.write_text(json.dumps(scores, indent=2))
+
+    return summary
+
+
+def cmd_batch_assess(variants: list[tuple[str, str]], assertions_path: str,
+                     test_cases_path: str, model: str, runner_cmd: str | None,
+                     parallel: bool, track_baseline: bool = False):
+    """Assess all test cases for multiple variants, summarize, and compare.
+
+    variants: list of (name, artifact_path) tuples
+    """
+    test_cases = load_all_test_cases(test_cases_path)
+    assertions = load_assertions(assertions_path)
+
+    if not runner_cmd:
+        _ensure_venv()
+
+    print(f"Batch assessment: {len(variants)} variant(s) x {len(test_cases)} test cases")
+    print(f"Parallelism: {'enabled' if parallel else 'disabled'}")
+    print("=" * 60)
+
+    sem = asyncio.Semaphore(_MAX_PARALLEL)
+    all_summaries = []
+
+    async def run():
+        for variant_name, artifact_path in variants:
+            print(f"\n--- {variant_name}: {artifact_path} ---", flush=True)
+
+            if parallel:
+                results = list(await asyncio.gather(*[
+                    _assess_one_async(variant_name, artifact_path, case,
+                                      assertions, model, runner_cmd, sem)
+                    for case in test_cases
+                ]))
+            else:
+                results = []
+                for case in test_cases:
+                    result = await _assess_one_async(
+                        variant_name, artifact_path, case,
+                        assertions, model, runner_cmd, sem)
+                    results.append(result)
+
+            # Write per-test-case results
+            variant_dir = Path(RESULTS_DIR) / variant_name
+            variant_dir.mkdir(parents=True, exist_ok=True)
+            for result in results:
+                result_path = variant_dir / f"{result['id']}.json"
+                result_path.write_text(json.dumps(result, indent=2))
+
+            # Summarize
+            should_track = track_baseline and variant_name == "current"
+            summary = _summarize_results(variant_name, results, track_score=should_track)
+            all_summaries.append((variant_name, summary["pass_rate"]))
+
+            print(f"  Summary: {summary['passed']}/{summary['total']}"
+                  f" ({summary['pass_rate']:.1%})", flush=True)
+
+    asyncio.run(run())
+
+    # Compare
+    if len(all_summaries) > 1:
+        print("\n" + "=" * 60)
+        print("COMPARISON")
+        print("=" * 60)
+        all_summaries.sort(key=lambda x: x[1], reverse=True)
+        top_rate = all_summaries[0][1]
+        tied_at_top = sum(1 for _, r in all_summaries if r == top_rate)
+        for name, rate in all_summaries:
+            if rate == top_rate and tied_at_top == 1:
+                marker = " <-- BEST"
+            elif rate == top_rate and tied_at_top > 1:
+                marker = " <-- TIED"
+            else:
+                marker = ""
+            print(f"  {name:30s} {rate:.1%}{marker}")
+        print("=" * 60)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -450,6 +683,50 @@ def main():
                 print(f"Unknown flag: {sys.argv[i]}", file=sys.stderr)
                 sys.exit(1)
         cmd_summarize(results_dir, output_path, label, track_score)
+
+    elif command == "batch-assess":
+        variants = []
+        track_baseline = False
+        model = config.get("model", "sonnet")
+        runner_cmd = config.get("runner")
+        # Default: parallel for SDK mode, sequential for custom runner
+        parallel = config.get("parallel", runner_cmd is None)
+        i = 2
+        while i < len(sys.argv):
+            if sys.argv[i] == "--variant":
+                # Format: name:artifact_path
+                parts = sys.argv[i + 1].split(":", 1)
+                if len(parts) != 2:
+                    print(f"ERROR: --variant must be name:path, got '{sys.argv[i + 1]}'",
+                          file=sys.stderr)
+                    sys.exit(1)
+                variants.append((parts[0], parts[1]))
+                i += 2
+            elif sys.argv[i] == "--track-baseline":
+                track_baseline = True; i += 1
+            elif sys.argv[i] == "--model":
+                model = sys.argv[i + 1]; i += 2
+            elif sys.argv[i] == "--runner":
+                runner_cmd = sys.argv[i + 1]; i += 2
+            elif sys.argv[i] == "--assertions":
+                assertions_path = sys.argv[i + 1]; i += 2
+            elif sys.argv[i] == "--test-cases":
+                test_cases_path = sys.argv[i + 1]; i += 2
+            elif sys.argv[i] == "--parallel":
+                parallel = True; i += 1
+            elif sys.argv[i] == "--sequential":
+                parallel = False; i += 1
+            else:
+                print(f"Unknown flag: {sys.argv[i]}", file=sys.stderr)
+                sys.exit(1)
+
+        if not variants:
+            print("Usage: autoresearch-runner batch-assess --variant name:path "
+                  "[--variant name:path ...] [--track-baseline]", file=sys.stderr)
+            sys.exit(1)
+
+        cmd_batch_assess(variants, assertions_path, test_cases_path,
+                         model, runner_cmd, parallel, track_baseline)
 
     elif command == "compare":
         if len(sys.argv) < 4:
