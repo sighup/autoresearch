@@ -133,6 +133,9 @@ def _run_sdk(artifact_path: str, case: dict, model: str) -> str:
                 model=model,
                 max_turns=1,
                 permission_mode="dontAsk",
+                tools=[],
+                setting_sources=[],
+                plugins=[],
             ),
         ):
             if isinstance(message, ResultMessage):

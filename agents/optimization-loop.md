@@ -7,7 +7,7 @@ maxTurns: 200
 
 # AutoResearch Optimization Loop
 
-You are running an iterative red-teaming loop to improve an artifact's pass rate against a test suite.
+You are running an iterative optimization loop to improve an artifact's pass rate against a test suite.
 
 All working state lives under `.autoresearch/` in the current working directory. Setup is already complete — config.json, assertions, test cases, and the initial artifact are all in place.
 
@@ -56,6 +56,8 @@ After all test cases are assessed, `autoresearch-runner summarize` aggregates th
 
 Read `.autoresearch/test_cases.jsonl` to get the list of test case IDs. For each test case, spawn a subagent that runs one assessment. Spawn **all subagents in a single message** so they run concurrently.
 
+**Critical: do NOT set `run_in_background=true` on these Agent calls.** Parallelism here comes from issuing multiple Agent tool calls in a single message — Claude Code runs same-message tool calls concurrently and blocks until all of them return. Backgrounding would cause each subagent's `autoresearch-runner assess` process to be killed when its turn ends, before the assessment finishes writing its result JSON. The symptom is empty `.autoresearch/results/<variant>/` directories and a loop that appears to hang or summarize nothing. Always pass `run_in_background=false` explicitly.
+
 Each subagent should run:
 
 ```bash
@@ -69,12 +71,12 @@ In prompt mode, the artifact path is `.autoresearch/prompts/current.txt` (or a c
 
 The runner reads `model` and `runner` from `.autoresearch/config.json` automatically. You can override per-call with `--model <name>` or `--runner <cmd>`.
 
-Example — assessing 3 test cases for the current artifact in parallel:
+Example — assessing 3 test cases for the current artifact in parallel (all three calls go in a single message):
 
 ```
-Agent(name="tc-api-health", prompt="Run this command and report the result:\nautoresearch-runner assess --artifact .autoresearch/prompts/current.txt --test-case api-health --output .autoresearch/results/current/api-health.json")
-Agent(name="tc-cli-export", prompt="Run this command and report the result:\nautoresearch-runner assess --artifact .autoresearch/prompts/current.txt --test-case cli-export --output .autoresearch/results/current/cli-export.json")
-Agent(name="tc-edge-empty", prompt="Run this command and report the result:\nautoresearch-runner assess --artifact .autoresearch/prompts/current.txt --test-case edge-empty --output .autoresearch/results/current/edge-empty.json")
+Agent(name="tc-api-health", run_in_background=false, prompt="Run this command and report the result:\nautoresearch-runner assess --artifact .autoresearch/prompts/current.txt --test-case api-health --output .autoresearch/results/current/api-health.json")
+Agent(name="tc-cli-export", run_in_background=false, prompt="Run this command and report the result:\nautoresearch-runner assess --artifact .autoresearch/prompts/current.txt --test-case cli-export --output .autoresearch/results/current/cli-export.json")
+Agent(name="tc-edge-empty", run_in_background=false, prompt="Run this command and report the result:\nautoresearch-runner assess --artifact .autoresearch/prompts/current.txt --test-case edge-empty --output .autoresearch/results/current/edge-empty.json")
 ```
 
 ### Step 2: Summarize results
@@ -142,7 +144,9 @@ Each variant MUST change exactly ONE thing. For code artifacts, this could be a 
 - `.autoresearch/results/v{cycle}b/<test-id>.json`
 - `.autoresearch/results/v{cycle}c/<test-id>.json`
 
-**Custom runner mode**: Candidates cannot run in parallel since they modify the same artifact. Run each variant sequentially: apply the change, assess all test cases (these CAN be parallel), summarize, then restore before the next variant.
+The same foreground rule from Step 1 applies: every Agent call must pass `run_in_background=false`. Parallelism is achieved by issuing all the calls in a single message, not by backgrounding them.
+
+**Custom runner mode**: Candidates cannot run in parallel since they modify the same artifact. Run each variant sequentially: apply the change, assess all test cases (these CAN be parallel, still foreground), summarize, then restore before the next variant.
 
 After all complete, summarize each and compare:
 

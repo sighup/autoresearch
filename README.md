@@ -15,42 +15,6 @@ Each optimization cycle:
 5. **Promote** — If a candidate beats the current best, it becomes the new baseline
 6. **Repeat** — Continue until pass rate exceeds 90% or 15 cycles are exhausted
 
-## Use Cases
-
-### Software Development
-
-- **System prompts for coding assistants** — You have a prompt that helps Claude generate API endpoints, but it keeps forgetting error handling or skips input validation. Write assertions for `assert_has_error_handling`, `assert_validates_input`, `assert_returns_proper_status_codes` and let AutoResearch find the phrasing that makes them stick.
-
-- **Code review prompts** — Your review prompt catches style issues but misses security problems. Create test cases with known vulnerabilities (SQL injection, XSS, hardcoded secrets) and assert that the review flags each one.
-
-- **Test generation prompts** — Your prompt generates unit tests but they're brittle — too coupled to implementation details, missing edge cases, or not testing the actual behavior. Assert that generated tests cover error paths, use meaningful assertions (not just `toBeTruthy`), and avoid mocking internals. Test across different function signatures and complexity levels.
-
-- **Technical documentation generators** — Your prompt produces API docs but inconsistently includes examples, parameter types, or error responses. Assert the structure you need and optimize until every section reliably appears.
-
-- **Migration and upgrade assistants** — A prompt that guides users through framework upgrades (e.g., React 18 to 19). Test across different project structures and assert it identifies breaking changes, suggests the correct replacements, and doesn't hallucinate deprecated APIs.
-
-### Beyond Code
-
-- **Customer support response templates** — Optimize a prompt that drafts support replies. Assert it acknowledges the customer's issue, avoids making promises about timelines, includes relevant help center links, and stays under a word limit.
-
-- **Lesson plan generators** — A teacher's prompt for creating lesson plans. Assert it includes learning objectives, estimated time per activity, materials needed, and differentiation strategies. Test across subjects and grade levels.
-
-- **Recipe adaptation** — A prompt that modifies recipes for dietary restrictions. Assert it removes the right ingredients, suggests appropriate substitutes, and adjusts cooking times. Test across allergies, vegan, keto, etc.
-
-- **Real estate listing descriptions** — Assert the output mentions square footage, number of rooms, neighborhood highlights, and avoids fair housing violations. Test with different property types and price ranges.
-
-- **Meeting summary prompts** — Optimize a prompt that turns meeting transcripts into structured summaries. Assert it captures action items, assigns owners, and notes deadlines. Test with messy, overlapping conversations.
-
-### Beyond Prompts (Custom Runners)
-
-AutoResearch can optimize any artifact, not just prompts. Provide a custom runner command that knows how to assess your artifact, and assertions grade its output.
-
-- **Test suite performance** — Your unit tests take 10 minutes and you want them under 8. The runner executes the test suite and reports timing; assertions check `assert_all_tests_pass` and `assert_under_target_time`. The loop agent tries parallelization, fixture scoping, test ordering, and other optimizations.
-
-- **Build configuration** — Your build takes too long or produces oversized bundles. The runner runs the build and reports size/time; assertions enforce thresholds.
-
-- **Database queries** — A slow query needs optimization. The runner executes the query and reports execution time and row counts; assertions check performance targets and result correctness.
-
 ## Setup
 
 ### Install the plugin
