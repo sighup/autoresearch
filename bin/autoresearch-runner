@@ -624,7 +624,7 @@ def cmd_report(cycle: int):
 
     Reads summary_current.json and summary_v{cycle}{a,b,c,...}.json,
     plus scores.json for the trajectory. Outputs a ready-to-display
-    markdown table with per-assertion pass rates.
+    table with per-assertion pass rates and aligned columns.
     """
     current_file = Path(RESULTS_DIR) / "summary_current.json"
     if not current_file.exists():
@@ -646,22 +646,14 @@ def cmd_report(cycle: int):
         print(f"No candidate summaries found for cycle {cycle}", file=sys.stderr)
         sys.exit(1)
 
-    # Build header
-    assertion_cols = " | ".join(a for a in assertion_names)
-    header = f"| Variant | Pass Rate | {assertion_cols} | vs Current |"
-    separator = "|" + "|".join("-" * (len(c) + 2) for c in
-                               ["Variant", "Pass Rate"] + assertion_names + ["vs Current"]) + "|"
-
-    print(f"## Cycle {cycle} Results\n")
-    print(header)
-    print(separator)
-
+    # Build rows first so we can compute column widths
+    columns = ["Variant", "Pass Rate"] + assertion_names + ["vs Current"]
+    rows = []
     best_name, best_rate = "current", current_rate
+
     for name, summary in variants:
         rate = summary["pass_rate"]
-        pct = f"{rate:.0%}"
         a_rates = summary.get("assertion_pass_rates", {})
-        a_cols = " | ".join(f"{a_rates.get(a, 0):.0%}" for a in assertion_names)
 
         if name == "current":
             delta = "—"
@@ -671,20 +663,44 @@ def cmd_report(cycle: int):
             if rate > best_rate:
                 best_name, best_rate = name, rate
 
-        print(f"| {name} | {pct} | {a_cols} | {delta} |")
+        row = [name, f"{rate:.0%}"]
+        row += [f"{a_rates.get(a, 0):.0%}" for a in assertion_names]
+        row += [delta]
+        rows.append(row)
 
-    # Winner line
+    # Compute column widths
+    widths = [len(c) for c in columns]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt_row(cells):
+        return "| " + " | ".join(c.ljust(widths[i]) for i, c in enumerate(cells)) + " |"
+
+    def fmt_sep():
+        return "|" + "|".join("-" * (w + 2) for w in widths) + "|"
+
+    # Print report
+    print(f"## Cycle {cycle} Results\n")
+    print(fmt_row(columns))
+    print(fmt_sep())
+    for row in rows:
+        print(fmt_row(row))
+
+    # Winner / no improvement
+    print()
     if best_name != "current":
-        print(f"\n**Winner:** {best_name} ({best_rate:.0%})")
+        print(f"Winner: {best_name} ({best_rate:.0%})")
     else:
-        print(f"\n**No improvement.** Current remains at {current_rate:.0%}.")
+        print(f"No improvement. Current remains at {current_rate:.0%}.")
 
     # Trajectory from scores.json
     scores_path = Path(SCORES_FILE)
     if scores_path.exists():
         scores = json.loads(scores_path.read_text())
-        trajectory = " → ".join(f"{s['pass_rate']:.0%}" for s in scores)
-        print(f"**Trajectory:** {trajectory}")
+        if scores:
+            trajectory = " → ".join(f"{s['pass_rate']:.0%}" for s in scores)
+            print(f"Trajectory: {trajectory}")
 
 
 # ---------------------------------------------------------------------------
