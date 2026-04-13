@@ -1,0 +1,5 @@
+{"id": "find_duplicates", "input": "Find duplicates in a list of 300 items with 100 duplicates", "category": "collection"}
+{"id": "sorted_unique", "input": "Sort and deduplicate a reversed list of 450 items", "category": "collection"}
+{"id": "group_by", "input": "Group 600 records by department key", "category": "aggregation"}
+{"id": "brute_force_search", "input": "Search 300 employee records by department", "category": "search"}
+{"id": "closest_pair", "input": "Find closest pair in 600 numbers", "category": "algorithm"}
