@@ -217,17 +217,7 @@ If a candidate beats the current best:
 
 If no candidate beats current, note what was tried in `.autoresearch/results/failure_analysis.txt`.
 
-### 7. Report
-
-Run the report command and output its result. This is required — do not skip this step.
-
-```bash
-autoresearch-runner report --cycle {cycle}
-```
-
-This produces a formatted comparison table with per-assertion pass rates, the winner, and the score trajectory. Output the command's stdout directly — do not reformat or reinterpret it.
-
-### 8. Repeat
+### 7. Repeat
 
 Mark the current cycle task completed with the outcome, then create the next cycle's task:
 ```

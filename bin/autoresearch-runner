@@ -596,23 +596,72 @@ def cmd_batch_assess(variants: list[tuple[str, str]], assertions_path: str,
 
     asyncio.run(run())
 
-    # Compare
-    if len(all_summaries) > 1:
-        print("\n" + "=" * 60)
-        print("COMPARISON")
-        print("=" * 60)
-        all_summaries.sort(key=lambda x: x[1], reverse=True)
-        top_rate = all_summaries[0][1]
-        tied_at_top = sum(1 for _, r in all_summaries if r == top_rate)
-        for name, rate in all_summaries:
-            if rate == top_rate and tied_at_top == 1:
-                marker = " <-- BEST"
-            elif rate == top_rate and tied_at_top > 1:
-                marker = " <-- TIED"
+    # Print formatted report table
+    if all_summaries:
+        # Reload summaries for assertion-level detail
+        variant_data = []
+        assertion_names = set()
+        for vname, _ in all_summaries:
+            spath = Path(RESULTS_DIR) / f"summary_{vname}.json"
+            if spath.exists():
+                s = json.loads(spath.read_text())
+                variant_data.append((vname, s))
+                assertion_names.update(s.get("assertion_pass_rates", {}).keys())
+        assertion_names = sorted(assertion_names)
+
+        current_rate = next((s["pass_rate"] for n, s in variant_data if n == "current"), None)
+
+        # Build rows
+        columns = ["Variant", "Pass Rate"] + assertion_names + ["vs Current"]
+        rows = []
+        best_name, best_rate = "current", current_rate or 0
+
+        for vname, summary in variant_data:
+            rate = summary["pass_rate"]
+            a_rates = summary.get("assertion_pass_rates", {})
+
+            if vname == "current":
+                delta = "—"
             else:
-                marker = ""
-            print(f"  {name:30s} {rate:.1%}{marker}")
-        print("=" * 60)
+                d = (rate - (current_rate or 0)) * 100
+                delta = f"+{d:.0f}%" if d >= 0 else f"{d:.0f}%"
+                if rate > best_rate:
+                    best_name, best_rate = vname, rate
+
+            row = [vname, f"{rate:.0%}"]
+            row += [f"{a_rates.get(a, 0):.0%}" for a in assertion_names]
+            row += [delta]
+            rows.append(row)
+
+        # Compute column widths and print
+        widths = [len(c) for c in columns]
+        for row in rows:
+            for i, cell in enumerate(row):
+                widths[i] = max(widths[i], len(cell))
+
+        def fmt_row(cells):
+            return "| " + " | ".join(c.ljust(widths[i]) for i, c in enumerate(cells)) + " |"
+
+        def fmt_sep():
+            return "|" + "|".join("-" * (w + 2) for w in widths) + "|"
+
+        print("\n" + fmt_row(columns))
+        print(fmt_sep())
+        for row in rows:
+            print(fmt_row(row))
+
+        if best_name != "current":
+            print(f"\nWinner: {best_name} ({best_rate:.0%})")
+        elif current_rate is not None:
+            print(f"\nNo improvement. Current: {current_rate:.0%}")
+
+        # Trajectory
+        scores_path = Path(SCORES_FILE)
+        if scores_path.exists():
+            scores = json.loads(scores_path.read_text())
+            if scores:
+                trajectory = " → ".join(f"{s['pass_rate']:.0%}" for s in scores)
+                print(f"Trajectory: {trajectory}")
 
 
 # ---------------------------------------------------------------------------
