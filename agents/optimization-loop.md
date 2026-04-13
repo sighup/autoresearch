@@ -224,16 +224,18 @@ After promoting (or deciding not to promote), output a brief text summary. This 
 ```
 ## Cycle N Results
 
-| Variant | Pass Rate | vs Current |
-|---------|-----------|------------|
-| current | 72%       | —          |
-| vNa     | 68%       | -4%        |
-| vNb     | 78%       | +6%        |
-| vNc     | 71%       | -1%        |
+| Variant | Pass Rate | assert_x | assert_y | assert_z | vs Current |
+|---------|-----------|----------|----------|----------|------------|
+| current | 72%       | 90%      | 60%      | 70%      | —          |
+| vNa     | 68%       | 85%      | 55%      | 65%      | -4%        |
+| vNb     | 78%       | 95%      | 70%      | 70%      | +6%        |
+| vNc     | 71%       | 90%      | 60%      | 65%      | -1%        |
 
 **Winner:** vNb (78%) — <one-line description of what changed>
 **Trajectory:** 65% → 68% → 72% → 78%
 ```
+
+Read the `assertion_pass_rates` from each variant's summary JSON to populate the per-assertion columns. Use the actual assertion function names as column headers.
 
 If no candidate improved:
 ```
