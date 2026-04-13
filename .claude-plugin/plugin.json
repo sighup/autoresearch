@@ -5,18 +5,5 @@
   "author": {
     "name": "Matt Saliano"
   },
-  "keywords": ["prompt-optimization", "evals", "iterative-optimization", "autoresearch"],
-  "hooks": {
-    "TaskCompleted": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/cycle-report.sh",
-            "timeout": 10
-          }
-        ]
-      }
-    ]
-  }
+  "keywords": ["prompt-optimization", "evals", "iterative-optimization", "autoresearch"]
 }

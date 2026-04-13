@@ -1,0 +1,16 @@
+{
+  "description": "Autoresearch cycle reporting",
+  "hooks": {
+    "TaskCompleted": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/cycle-report.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
