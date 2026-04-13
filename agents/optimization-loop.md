@@ -219,32 +219,13 @@ If no candidate beats current, note what was tried in `.autoresearch/results/fai
 
 ### 7. Report
 
-After promoting (or deciding not to promote), output a brief text summary. This is required — do not skip this step.
+Run the report command and output its result. This is required — do not skip this step.
 
-```
-## Cycle N Results
-
-| Variant | Pass Rate | assert_x | assert_y | assert_z | vs Current |
-|---------|-----------|----------|----------|----------|------------|
-| current | 72%       | 90%      | 60%      | 70%      | —          |
-| vNa     | 68%       | 85%      | 55%      | 65%      | -4%        |
-| vNb     | 78%       | 95%      | 70%      | 70%      | +6%        |
-| vNc     | 71%       | 90%      | 60%      | 65%      | -1%        |
-
-**Winner:** vNb (78%) — <one-line description of what changed>
-**Trajectory:** 65% → 68% → 72% → 78%
+```bash
+autoresearch-runner report --cycle {cycle}
 ```
 
-Read the `assertion_pass_rates` from each variant's summary JSON to populate the per-assertion columns. Use the actual assertion function names as column headers.
-
-If no candidate improved:
-```
-## Cycle N Results
-
-No improvement. Best candidate: vNa (71%) vs current (72%).
-Tried: <brief summary of the 3 changes attempted>
-**Trajectory:** 65% → 68% → 72% (unchanged)
-```
+This produces a formatted comparison table with per-assertion pass rates, the winner, and the score trajectory. Output the command's stdout directly — do not reformat or reinterpret it.
 
 ### 8. Repeat
 
