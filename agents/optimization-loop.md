@@ -93,6 +93,51 @@ autoresearch-runner summarize .autoresearch/results/current/ --output .autoresea
 autoresearch-runner compare .autoresearch/results/summary_current.json .autoresearch/results/summary_v1a.json .autoresearch/results/summary_v1b.json
 ```
 
+## Task Management
+
+Tasks drive the loop's execution and provide resumability. Each task represents a concrete unit of work — not a status label.
+
+### On startup — check for existing tasks
+
+Before doing any work, run `TaskList` to check if this loop was previously started.
+
+**If tasks exist with incomplete children:**
+1. Read `.autoresearch/results/scores.json` to find the last recorded score
+2. Find the last completed cycle task to determine the current cycle number
+3. Resume from the next incomplete task — do not repeat completed work
+
+**If no tasks exist (fresh start):**
+```
+TaskCreate("Optimization loop", description="Target: 90%, max 15 cycles")
+TaskCreate("Establish baseline", parentTaskId=<parent-id>)
+```
+
+Mark the baseline task `in_progress` and proceed to step 1.
+
+### Per-cycle tasks
+
+Create each cycle's task at the start of that cycle, not ahead of time:
+```
+TaskCreate("Cycle 1", parentTaskId=<parent-id>)
+TaskUpdate(id, status="in_progress")
+```
+
+When the cycle completes, update it with the outcome:
+```
+TaskUpdate(id, status="completed", description="72% — promoted v1b (+7%)")
+```
+or:
+```
+TaskUpdate(id, status="completed", description="65% — no improvement")
+```
+
+### On completion
+
+Mark the parent task completed with the final summary:
+```
+TaskUpdate(parent-id, status="completed", description="Final: 92% after 7 cycles (+27% from 65% baseline)")
+```
+
 ## Each Cycle
 
 ### 1. Establish baseline (first cycle only)
@@ -101,6 +146,13 @@ Spawn one subagent per test case to assess the current artifact (see above). The
 
 ```bash
 autoresearch-runner summarize .autoresearch/results/current/ --output .autoresearch/results/summary_current.json --label current --track-score
+```
+
+After summarizing, mark the baseline task completed and create the first cycle task:
+```
+TaskUpdate(baseline-task-id, status="completed", description="Baseline: 65% (13/20)")
+TaskCreate("Cycle 1", parentTaskId=<parent-id>)
+TaskUpdate(cycle-task-id, status="in_progress")
 ```
 
 ### 2. Analyze failures
@@ -180,7 +232,12 @@ If no candidate beats current, note what was tried in `.autoresearch/results/fai
 
 ### 7. Repeat
 
-Proceed to the next cycle with the updated artifact.
+Mark the current cycle task completed with the outcome, then create the next cycle's task and proceed:
+```
+TaskUpdate(cycle-task-id, status="completed", description="<pass-rate> — <promoted vNx | no improvement>")
+TaskCreate("Cycle N+1", parentTaskId=<parent-id>)
+TaskUpdate(new-cycle-task-id, status="in_progress")
+```
 
 ## Constraints
 
@@ -194,5 +251,11 @@ Proceed to the next cycle with the updated artifact.
   - Add explicit "common mistakes" section
 
 ## When finished
+
+Mark the final cycle task and the parent task completed:
+```
+TaskUpdate(cycle-task-id, status="completed", description="<final pass-rate> — <outcome>")
+TaskUpdate(parent-id, status="completed", description="Final: <pass-rate> after <N> cycles (+<delta> from <baseline>%)")
+```
 
 Report the final pass rate, how many cycles were run, and what the key changes were. If the pass rate target was reached, note which cycle achieved it.
