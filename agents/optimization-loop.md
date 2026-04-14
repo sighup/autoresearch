@@ -52,55 +52,116 @@ After all test cases are assessed, `autoresearch-runner summarize` aggregates th
 
 ## Running assessments
 
-### Step 1: Assess each test case (parallel via subagents)
+Use `autoresearch-runner batch-assess` for all assessment work. It runs all test cases for one or more variants in a single process, handles parallelism internally, and automatically summarizes and compares results.
 
-Read `.autoresearch/test_cases.jsonl` to get the list of test case IDs. For each test case, spawn a subagent that runs one assessment. Spawn **all subagents in a single message** so they run concurrently.
+**Run it in the background and stream progress via Monitor.** `batch-assess` can take many minutes; running it inline blocks the loop and hides progress from the user's session. Instead:
 
-**Critical: do NOT set `run_in_background=true` on these Agent calls.** Parallelism here comes from issuing multiple Agent tool calls in a single message — Claude Code runs same-message tool calls concurrently and blocks until all of them return. Backgrounding would cause each subagent's `autoresearch-runner assess` process to be killed when its turn ends, before the assessment finishes writing its result JSON. The symptom is empty `.autoresearch/results/<variant>/` directories and a loop that appears to hang or summarize nothing. Always pass `run_in_background=false` explicitly.
-
-Each subagent should run:
-
-```bash
-autoresearch-runner assess \
-  --artifact <artifact-path> \
-  --test-case <test-case-id> \
-  --output .autoresearch/results/<variant-name>/<test-case-id>.json
-```
-
-In prompt mode, the artifact path is `.autoresearch/prompts/current.txt` (or a candidate). In custom runner mode, it's whatever `config.json` points to — the runner and artifact path are read from config automatically, so you can omit `--artifact` if it hasn't changed.
-
-The runner reads `model` and `runner` from `.autoresearch/config.json` automatically. You can override per-call with `--model <name>` or `--runner <cmd>`.
-
-Example — assessing 3 test cases for the current artifact in parallel (all three calls go in a single message):
-
-```
-Agent(name="tc-api-health", run_in_background=false, prompt="Run this command and report the result:\nautoresearch-runner assess --artifact .autoresearch/prompts/current.txt --test-case api-health --output .autoresearch/results/current/api-health.json")
-Agent(name="tc-cli-export", run_in_background=false, prompt="Run this command and report the result:\nautoresearch-runner assess --artifact .autoresearch/prompts/current.txt --test-case cli-export --output .autoresearch/results/current/cli-export.json")
-Agent(name="tc-edge-empty", run_in_background=false, prompt="Run this command and report the result:\nautoresearch-runner assess --artifact .autoresearch/prompts/current.txt --test-case edge-empty --output .autoresearch/results/current/edge-empty.json")
-```
-
-### Step 2: Summarize results
-
-After all subagents complete, aggregate results:
+1. Launch `batch-assess` with `run_in_background: true`, redirecting output to a per-cycle log.
+2. Start a `Monitor` on that log, filtered for meaningful events, so the user sees cycle progress in real time.
+3. When the background task completes (you'll be notified), read summary JSONs and continue.
 
 ```bash
-autoresearch-runner summarize .autoresearch/results/current/ --output .autoresearch/results/summary_current.json --label current
+# Launch via Bash with run_in_background=true:
+autoresearch-runner batch-assess \
+  --variant current:.autoresearch/prompts/current.txt \
+  --track-baseline \
+  > .autoresearch/results/cycle0.log 2>&1
 ```
 
-### Step 3: Compare (when assessing multiple prompts)
+```bash
+# Monitor filter — matches progress + every terminal/failure signature:
+tail -f .autoresearch/results/cycle0.log | \
+  grep -E --line-buffered \
+    "Assessing|Winner:|Baseline:|pass_rate|Promoted|ERROR|Traceback|FAILED|Cycle [0-9]+"
+```
+
+Use one log file and one Monitor per cycle (timeout ~3600000ms). Do not set `persistent: true` — the monitor should end with the cycle.
+
+**Do NOT poll the background task.** Wait for the completion notification, then proceed.
+
+**Full-cycle example (current + 3 candidates):**
 
 ```bash
-autoresearch-runner compare .autoresearch/results/summary_current.json .autoresearch/results/summary_v1a.json .autoresearch/results/summary_v1b.json
+autoresearch-runner batch-assess \
+  --variant current:.autoresearch/prompts/current.txt \
+  --variant v1a:.autoresearch/prompts/candidates/v1a.txt \
+  --variant v1b:.autoresearch/prompts/candidates/v1b.txt \
+  --variant v1c:.autoresearch/prompts/candidates/v1c.txt \
+  > .autoresearch/results/cycle1.log 2>&1
+```
+
+Each `--variant` is `name:artifact_path`. The runner reads `model`, `runner`, `assertions`, `test_cases`, and `parallel` from `.autoresearch/config.json` automatically.
+
+**Parallelism:** In SDK mode (no runner), test cases run in parallel by default. In custom runner mode, they run sequentially by default — override with `"parallel": true` in config.json if your runner is safe for concurrent invocation. Variants always run sequentially.
+
+**Output:** The command writes per-test-case JSONs to `.autoresearch/results/<variant>/`, summary JSONs to `.autoresearch/results/summary_<variant>.json`, and prints a comparison table. Progress lines stream to the cycle log as each test case completes.
+
+## Task Management
+
+Tasks drive the loop's execution and provide resumability. Each task represents a concrete unit of work — not a status label.
+
+### On startup — check for existing tasks
+
+Before doing any work, run `TaskList` to check if this loop was previously started.
+
+**If tasks exist with incomplete children:**
+1. Read `.autoresearch/results/scores.json` to find the last recorded score
+2. Find the last completed cycle task to determine the current cycle number
+3. Resume from the next incomplete task — do not repeat completed work
+
+**If no tasks exist (fresh start):**
+```
+TaskCreate("Optimization loop", description="Target: 90%, max 15 cycles")
+TaskCreate("Establish baseline", parentTaskId=<parent-id>)
+```
+
+Mark the baseline task `in_progress` and proceed to step 1.
+
+### Per-cycle tasks
+
+At the start of each cycle, create a cycle task:
+
+```
+cycle_id = TaskCreate("Cycle N", parentTaskId=<parent-id>)
+TaskUpdate(cycle_id, status="in_progress")
+```
+
+When the cycle completes, update it with the outcome (this one-liner is what the user sees in the sidebar and is what a resumed run reads on crash recovery):
+```
+TaskUpdate(cycle_id, status="completed", description="72% — promoted v1b (+7%)")
+```
+or:
+```
+TaskUpdate(cycle_id, status="completed", description="65% — no improvement")
+```
+
+### On completion
+
+Mark the parent task completed with the final summary:
+```
+TaskUpdate(parent-id, status="completed", description="Final: 92% after 7 cycles (+27% from 65% baseline)")
 ```
 
 ## Each Cycle
 
 ### 1. Establish baseline (first cycle only)
 
-Spawn one subagent per test case to assess the current artifact (see above). Then summarize with `--track-score` to record the baseline in scores.json:
+Assess the current artifact against all test cases. Run in the background with a Monitor on the log (see "Running assessments" above):
 
 ```bash
-autoresearch-runner summarize .autoresearch/results/current/ --output .autoresearch/results/summary_current.json --label current --track-score
+autoresearch-runner batch-assess \
+  --variant current:.autoresearch/prompts/current.txt \
+  --track-baseline \
+  > .autoresearch/results/cycle0.log 2>&1
+```
+
+Invoke via Bash with `run_in_background: true`, then start a Monitor on `cycle0.log`. Wait for the completion notification before reading summaries. This writes results, summary, and records the baseline score in `scores.json`.
+
+After it completes, mark the baseline task completed and create the first cycle task:
+```
+TaskUpdate(baseline-task-id, status="completed", description="Baseline: 65% (13/20)")
+TaskCreate("Cycle 1", parentTaskId=<parent-id>)
+TaskUpdate(cycle-task-id, status="in_progress")
 ```
 
 ### 2. Analyze failures
@@ -136,51 +197,57 @@ Each variant MUST differ from `current.txt` in exactly ONE way so improvements c
 
 Each variant MUST change exactly ONE thing. For code artifacts, this could be a config change, a refactor, adding parallelism, etc. Describe each change in `failure_analysis.txt` so it can be reproduced if promoted.
 
-### 5. Assess all candidates (parallel)
+### 5. Assess all candidates
 
-**Prompt mode**: Spawn subagents for ALL prompts (current + 3 candidates) x ALL test cases in a single message. Use separate output directories per variant:
-- `.autoresearch/results/current/<test-id>.json`
-- `.autoresearch/results/v{cycle}a/<test-id>.json`
-- `.autoresearch/results/v{cycle}b/<test-id>.json`
-- `.autoresearch/results/v{cycle}c/<test-id>.json`
-
-The same foreground rule from Step 1 applies: every Agent call must pass `run_in_background=false`. Parallelism is achieved by issuing all the calls in a single message, not by backgrounding them.
-
-**Custom runner mode**: Candidates cannot run in parallel since they modify the same artifact. Run each variant sequentially: apply the change, assess all test cases (these CAN be parallel, still foreground), summarize, then restore before the next variant.
-
-After all complete, summarize each and compare:
+**Prompt mode**: Assess current + all 3 candidates in one batch, in the background, with a Monitor on the cycle log:
 
 ```bash
-autoresearch-runner summarize .autoresearch/results/current/ --output .autoresearch/results/summary_current.json --label current
-autoresearch-runner summarize .autoresearch/results/v1a/ --output .autoresearch/results/summary_v1a.json --label v1a
-autoresearch-runner summarize .autoresearch/results/v1b/ --output .autoresearch/results/summary_v1b.json --label v1b
-autoresearch-runner summarize .autoresearch/results/v1c/ --output .autoresearch/results/summary_v1c.json --label v1c
-autoresearch-runner compare .autoresearch/results/summary_current.json .autoresearch/results/summary_v1a.json .autoresearch/results/summary_v1b.json .autoresearch/results/summary_v1c.json
+autoresearch-runner batch-assess \
+  --variant current:.autoresearch/prompts/current.txt \
+  --variant v{cycle}a:.autoresearch/prompts/candidates/v{cycle}a.txt \
+  --variant v{cycle}b:.autoresearch/prompts/candidates/v{cycle}b.txt \
+  --variant v{cycle}c:.autoresearch/prompts/candidates/v{cycle}c.txt \
+  > .autoresearch/results/cycle{cycle}.log 2>&1
 ```
+
+Launch via Bash with `run_in_background: true`, start a Monitor on `cycle{cycle}.log`, then wait for completion.
+
+**Custom runner mode**: Each variant requires modifying the artifact, so assess them one at a time. For each variant: apply the change, run batch-assess (backgrounded, with Monitor) for just that variant, wait for completion, then restore the original before the next:
+
+```bash
+# Apply variant change, then:
+autoresearch-runner batch-assess --variant v{cycle}a:<artifact-path> \
+  > .autoresearch/results/cycle{cycle}_v{cycle}a.log 2>&1
+# Restore original, repeat for v{cycle}b, v{cycle}c
+```
+
+The runner handles test-case parallelism internally based on the `parallel` config setting. Results, summaries, and comparison are all produced automatically.
 
 ### 6. Promote winner (if any)
 
-If a candidate beats the current best:
+`batch-assess` already printed the winner (look for the `Winner: v{cycle}X` line). If a candidate beats current, promote it with ONE command:
 
-**Prompt mode**:
-1. Copy current to `.autoresearch/prompts/history/v{cycle}_score{rate}.txt`
-2. Copy winning candidate to `.autoresearch/prompts/current.txt`
-3. Re-summarize the winner with `--track-score` to record it in scores.json:
-   ```bash
-   autoresearch-runner summarize .autoresearch/results/<winner>/ --output .autoresearch/results/summary_<winner>.json --label <winner> --track-score
-   ```
-4. Clear `.autoresearch/prompts/candidates/`
+```bash
+autoresearch-runner promote v{cycle}a --cycle {cycle}
+```
 
-**Custom runner mode**:
-1. Save the current artifact state to `.autoresearch/history/v{cycle}_score{rate}/` (copy the relevant files)
-2. Apply the winning change to the artifact
-3. Re-summarize and track score as above
+This single command:
+1. Archives the previous current artifact to `.autoresearch/history/v{cycle}_score{rate}/` (custom runner) or `.autoresearch/prompts/history/v{cycle}_score{rate}.txt` (prompt mode)
+2. Applies the winner (prompt mode: copies candidate to current.txt; custom runner: assumes you've already applied the change and just archives)
+3. Appends the winner's pass_rate to `scores.json` — so the trajectory and scorecard are always complete
 
-If no candidate beats current, note what was tried in `.autoresearch/results/failure_analysis.txt`.
+**Prompt mode**: call `promote` directly — it copies the candidate file to current.
+**Custom runner mode**: re-apply the winning change to the artifact file FIRST (since variants are restored after assessment), THEN call `promote`.
+
+**Alternative one-step for prompt mode**: pass `--promote-winner` to `batch-assess` and it auto-promotes the winner if one exists.
+
+If no candidate beats current, note what was tried in `.autoresearch/results/failure_analysis.txt`. Do NOT call `promote`.
 
 ### 7. Repeat
 
-Proceed to the next cycle with the updated artifact.
+Decide whether to continue: if pass rate ≥ 90% or cycles ≥ 15, stop (go to "When finished"). Otherwise, create the next cycle task (see "Per-cycle tasks") and loop back to Step 2.
+
+`autoresearch-runner report --cycle N` is available as an on-demand utility for a formatted comparison table, but is not a required step — Monitor already streams cycle progress live during the run.
 
 ## Constraints
 
@@ -194,5 +261,38 @@ Proceed to the next cycle with the updated artifact.
   - Add explicit "common mistakes" section
 
 ## When finished
+
+By the time you reach this point, the last cycle task is already completed. Produce a final report, then a written summary, then close the parent task.
+
+**1. Print the full-run trajectory** via the runner so the user sees a deterministic, pre-formatted summary of the whole run — baseline, every cycle, every promotion, and the final score:
+
+```bash
+autoresearch-runner report
+```
+
+Run this inline (not backgrounded) — it reads `scores.json` and summary files and exits quickly. Its stdout lands directly in the user's session.
+
+**2. Write a prose summary of the run.** The deterministic table shows *what* happened; your summary should explain *why* it happened. You have all the context — use it.
+
+Read (if not already in context):
+- `.autoresearch/results/scores.json` — trajectory
+- `.autoresearch/results/failure_analysis.txt` — every cycle's analysis, accumulated
+- `.autoresearch/prompts/history/` (prompt mode) or `.autoresearch/history/` (custom runner) — archived winning variants at each promotion
+- The final artifact (`.autoresearch/prompts/current.txt` or the artifact file)
+
+Then write a 4–6 bullet summary covering:
+- **Headline**: baseline → final pass rate, and whether the 90% target was hit (and at which cycle).
+- **What moved the needle**: the 2–3 cycles with the largest Δ and the specific change that caused each.
+- **What didn't work**: patterns you tried that failed — variants that regressed, structural changes that had no effect. Be concrete, not hedging.
+- **Final artifact character**: how the winning artifact differs from the baseline in one or two sentences. Not a diff, a description.
+- **Remaining failures**: which assertions or test categories are still failing at the final score, and a brief guess at why they're hard (e.g. "ambiguous test inputs", "assertion is over-strict", "requires reasoning the model consistently omits"). This is the most valuable part for the user — it tells them whether to keep optimizing or revise the test suite.
+
+Print this summary directly in your response. Do not write it to a file — it's an end-of-run message, not an artifact. Do not repeat the trajectory table; the runner already printed it.
+
+**3. Mark the parent task completed** with a one-line sidebar summary:
+
+```
+TaskUpdate(parent-id, status="completed", description="Final: <pass-rate> after <N> cycles (+<delta> from <baseline>%)")
+```
 
 Report the final pass rate, how many cycles were run, and what the key changes were. If the pass rate target was reached, note which cycle achieved it.

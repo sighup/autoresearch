@@ -6,13 +6,19 @@ Assesses artifacts against test cases using either the Claude Agent SDK
 
 Commands:
     autoresearch-runner assess --artifact P --test-case TC [--output FILE]
+    autoresearch-runner batch-assess --variant name:path [--variant ...] [--track-baseline] [--promote-winner]
+    autoresearch-runner promote <variant> [--cycle N]
+    autoresearch-runner report [--cycle N]
     autoresearch-runner summarize <results-dir> [--output FILE]
     autoresearch-runner compare <result1.json> <result2.json> ...
 """
 
+import asyncio
 import importlib.util
 import json
 import os
+import re
+import shutil
 import subprocess as _sp
 import sys
 import time
@@ -109,6 +115,15 @@ def load_test_case(test_cases_path: str, test_case_id: str) -> dict:
             return case
     print(f"ERROR: Test case '{test_case_id}' not found in {test_cases_path}", file=sys.stderr)
     sys.exit(1)
+
+
+def load_all_test_cases(test_cases_path: str) -> list[dict]:
+    """Load all test cases from a JSONL file."""
+    cases = []
+    for line in Path(test_cases_path).read_text().strip().split("\n"):
+        if line.strip():
+            cases.append(json.loads(line))
+    return cases
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +257,7 @@ def cmd_assess(artifact_path: str, test_case_id: str, assertions_path: str,
 # ---------------------------------------------------------------------------
 
 def cmd_summarize(results_dir: str, output_path: str | None, prompt_label: str | None,
-                   track_score: bool = False):
+                   track_score: bool = False, model: str | None = None):
     """Aggregate individual test case results into a run summary."""
     results_path = Path(results_dir)
     if not results_path.is_dir():
@@ -304,6 +319,7 @@ def cmd_summarize(results_dir: str, output_path: str | None, prompt_label: str |
     run_result = {
         "prompt": prompt_label or results_dir,
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "model": model,
         "pass_rate": round(pass_rate, 3),
         "passed": passed,
         "total": total,
@@ -339,6 +355,7 @@ def cmd_summarize(results_dir: str, output_path: str | None, prompt_label: str |
         scores.append({
             "prompt": prompt_label or results_dir,
             "timestamp": run_result["timestamp"],
+            "model": model,
             "pass_rate": run_result["pass_rate"],
             "assertion_pass_rates": assertion_rates,
         })
@@ -379,6 +396,559 @@ def cmd_compare(*result_files: str):
     elif len(rates) > 1 and best_rate > rates[-1][1]:
         print(f"\nBest: '{best_name}' at {best_rate:.1%}")
     print("=" * 60)
+
+
+# ---------------------------------------------------------------------------
+# batch-assess — assess all test cases for multiple variants in one process
+# ---------------------------------------------------------------------------
+
+_MAX_PARALLEL = 10  # limit concurrent assessments to avoid overwhelming APIs
+
+
+async def _assess_one_async(variant_name: str, artifact_path: str, case: dict,
+                            assertions: list, model: str, runner_cmd: str | None,
+                            sem: asyncio.Semaphore) -> dict:
+    """Assess a single test case asynchronously."""
+    async with sem:
+        start = time.time()
+        try:
+            if runner_cmd:
+                env = {**os.environ,
+                       "AUTORESEARCH_ARTIFACT": artifact_path,
+                       "AUTORESEARCH_TEST_ID": case["id"],
+                       "AUTORESEARCH_TEST_INPUT": case["input"]}
+                proc = await asyncio.create_subprocess_shell(
+                    runner_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                )
+                stdout, stderr = await proc.communicate()
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"Runner exited {proc.returncode}: {stderr.decode().strip()}")
+                output = stdout.decode()
+            else:
+                from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
+                prompt = Path(artifact_path).read_text()
+                output = ""
+                async for message in query(
+                    prompt=case["input"],
+                    options=ClaudeAgentOptions(
+                        system_prompt=prompt,
+                        model=model,
+                        max_turns=1,
+                        permission_mode="dontAsk",
+                        tools=[],
+                        setting_sources=[],
+                        plugins=[],
+                    ),
+                ):
+                    if isinstance(message, ResultMessage):
+                        if message.is_error:
+                            raise RuntimeError(f"SDK error: {message.result}")
+                        output = message.result or ""
+
+            elapsed = time.time() - start
+
+            assertion_results = {}
+            for fn in assertions:
+                try:
+                    assertion_results[fn.__name__] = fn(output)
+                except Exception as e:
+                    assertion_results[fn.__name__] = False
+                    print(f"  WARNING: {fn.__name__} raised {e}", file=sys.stderr)
+
+            case_passed = all(assertion_results.values())
+            failed = [k for k, v in assertion_results.items() if not v]
+
+            status = "PASS" if case_passed else f"FAIL [{', '.join(failed)}]"
+            print(f"  {variant_name}/{case['id']}: {status} ({elapsed:.1f}s)", flush=True)
+
+            return {
+                "id": case["id"],
+                "category": case.get("category", "unknown"),
+                "passed": case_passed,
+                "assertions": assertion_results,
+                "failed": failed,
+                "output": output,
+                "output_length": len(output),
+                "elapsed_seconds": round(elapsed, 1),
+            }
+        except Exception as e:
+            elapsed = time.time() - start
+            print(f"  {variant_name}/{case['id']}: ERROR ({elapsed:.1f}s): {e}",
+                  file=sys.stderr, flush=True)
+            return {
+                "id": case["id"],
+                "category": case.get("category", "unknown"),
+                "passed": False,
+                "assertions": {},
+                "failed": ["error"],
+                "error": str(e),
+                "output": "",
+                "output_length": 0,
+                "elapsed_seconds": round(elapsed, 1),
+            }
+
+
+def _summarize_results(variant_name: str, results: list[dict],
+                       track_score: bool = False,
+                       model: str | None = None) -> dict:
+    """Summarize a list of result dicts into a run summary. Returns the summary."""
+    passed = sum(1 for r in results if r["passed"])
+    total = len(results)
+    pass_rate = passed / total if total > 0 else 0
+
+    all_assertion_names = set()
+    for r in results:
+        all_assertion_names.update(r.get("assertions", {}).keys())
+
+    assertion_rates = {}
+    for name in sorted(all_assertion_names):
+        ap = sum(1 for r in results if r.get("assertions", {}).get(name, False))
+        assertion_rates[name] = round(ap / total, 3) if total > 0 else 0
+
+    categories = {}
+    for r in results:
+        cat = r.get("category", "unknown")
+        if cat not in categories:
+            categories[cat] = {"passed": 0, "total": 0}
+        categories[cat]["total"] += 1
+        if r["passed"]:
+            categories[cat]["passed"] += 1
+
+    summary = {
+        "prompt": variant_name,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "model": model,
+        "pass_rate": round(pass_rate, 3),
+        "passed": passed,
+        "total": total,
+        "assertion_pass_rates": assertion_rates,
+        "category_breakdown": categories,
+        "results": results,
+    }
+
+    summary_path = Path(RESULTS_DIR) / f"summary_{variant_name}.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(json.dumps(summary, indent=2))
+
+    if track_score:
+        scores_path = Path(SCORES_FILE)
+        scores = json.loads(scores_path.read_text()) if scores_path.exists() else []
+        scores.append({
+            "prompt": variant_name,
+            "timestamp": summary["timestamp"],
+            "model": model,
+            "pass_rate": summary["pass_rate"],
+            "assertion_pass_rates": assertion_rates,
+        })
+        scores_path.write_text(json.dumps(scores, indent=2))
+
+    return summary
+
+
+def cmd_batch_assess(variants: list[tuple[str, str]], assertions_path: str,
+                     test_cases_path: str, model: str, runner_cmd: str | None,
+                     parallel: bool, track_baseline: bool = False,
+                     promote_winner: bool = False):
+    """Assess all test cases for multiple variants, summarize, and compare.
+
+    variants: list of (name, artifact_path) tuples
+    If promote_winner: auto-call promote on the winning variant at the end.
+    """
+    test_cases = load_all_test_cases(test_cases_path)
+    assertions = load_assertions(assertions_path)
+
+    if not runner_cmd:
+        _ensure_venv()
+
+    print(f"Batch assessment: {len(variants)} variant(s) x {len(test_cases)} test cases")
+    mode = "custom runner" if runner_cmd else f"sdk ({model})"
+    print(f"Mode: {mode}")
+    print(f"Parallelism: {'enabled' if parallel else 'disabled'}")
+    print("=" * 60)
+
+    sem = asyncio.Semaphore(_MAX_PARALLEL)
+    all_summaries = []
+
+    async def run():
+        for variant_name, artifact_path in variants:
+            print(f"\n--- {variant_name}: {artifact_path} ---", flush=True)
+
+            if parallel:
+                results = list(await asyncio.gather(*[
+                    _assess_one_async(variant_name, artifact_path, case,
+                                      assertions, model, runner_cmd, sem)
+                    for case in test_cases
+                ]))
+            else:
+                results = []
+                for case in test_cases:
+                    result = await _assess_one_async(
+                        variant_name, artifact_path, case,
+                        assertions, model, runner_cmd, sem)
+                    results.append(result)
+
+            # Write per-test-case results
+            variant_dir = Path(RESULTS_DIR) / variant_name
+            variant_dir.mkdir(parents=True, exist_ok=True)
+            for result in results:
+                result_path = variant_dir / f"{result['id']}.json"
+                result_path.write_text(json.dumps(result, indent=2))
+
+            # Summarize — model is only meaningful in SDK mode
+            should_track = track_baseline and variant_name == "current"
+            effective_model = None if runner_cmd else model
+            summary = _summarize_results(variant_name, results,
+                                         track_score=should_track,
+                                         model=effective_model)
+            all_summaries.append((variant_name, summary["pass_rate"]))
+
+            print(f"  Summary: {summary['passed']}/{summary['total']}"
+                  f" ({summary['pass_rate']:.1%})", flush=True)
+
+    asyncio.run(run())
+
+    # Print formatted report table
+    if all_summaries:
+        # Reload summaries for assertion-level detail
+        variant_data = []
+        assertion_names = set()
+        for vname, _ in all_summaries:
+            spath = Path(RESULTS_DIR) / f"summary_{vname}.json"
+            if spath.exists():
+                s = json.loads(spath.read_text())
+                variant_data.append((vname, s))
+                assertion_names.update(s.get("assertion_pass_rates", {}).keys())
+        assertion_names = sorted(assertion_names)
+
+        current_rate = next((s["pass_rate"] for n, s in variant_data if n == "current"), None)
+
+        # Build rows
+        columns = ["Variant", "Pass Rate"] + assertion_names + ["vs Current"]
+        rows = []
+        best_name, best_rate = "current", current_rate or 0
+
+        for vname, summary in variant_data:
+            rate = summary["pass_rate"]
+            a_rates = summary.get("assertion_pass_rates", {})
+
+            if vname == "current":
+                delta = "—"
+            else:
+                d = (rate - (current_rate or 0)) * 100
+                delta = f"+{d:.0f}%" if d >= 0 else f"{d:.0f}%"
+                if rate > best_rate:
+                    best_name, best_rate = vname, rate
+
+            row = [vname, f"{rate:.0%}"]
+            row += [f"{a_rates.get(a, 0):.0%}" for a in assertion_names]
+            row += [delta]
+            rows.append(row)
+
+        # Compute column widths and print
+        widths = [len(c) for c in columns]
+        for row in rows:
+            for i, cell in enumerate(row):
+                widths[i] = max(widths[i], len(cell))
+
+        def fmt_row(cells):
+            return "| " + " | ".join(c.ljust(widths[i]) for i, c in enumerate(cells)) + " |"
+
+        def fmt_sep():
+            return "|" + "|".join("-" * (w + 2) for w in widths) + "|"
+
+        print("\n" + fmt_row(columns))
+        print(fmt_sep())
+        for row in rows:
+            print(fmt_row(row))
+
+        if best_name != "current":
+            print(f"\nWinner: {best_name} ({best_rate:.0%})")
+            if promote_winner:
+                print()
+                _promote_winner(best_name, model=model)
+        elif current_rate is not None:
+            print(f"\nNo improvement. Current: {current_rate:.0%}")
+
+        # Trajectory
+        scores_path = Path(SCORES_FILE)
+        if scores_path.exists():
+            scores = json.loads(scores_path.read_text())
+            if scores:
+                trajectory = " → ".join(f"{s['pass_rate']:.0%}" for s in scores)
+                print(f"Trajectory: {trajectory}")
+
+
+# ---------------------------------------------------------------------------
+# promote — apply a winning variant to current, archive prior state, track score
+# ---------------------------------------------------------------------------
+
+def _promote_winner(variant_name: str, cycle: int | None = None,
+                    model: str | None = None) -> bool:
+    """Apply variant_name as the new current, archive prior state, record score.
+
+    Returns True on success, False if the variant summary is missing.
+    Behavior depends on mode:
+      - Prompt mode: copies candidates/<variant>.txt -> current.txt
+      - Custom runner mode: archives current artifact, assumes caller has
+        already applied the change to the artifact file.
+    In both modes: appends the variant's pass_rate to scores.json with a
+    'promoted_from' field.
+    """
+    config = load_config()
+    summary_path = Path(RESULTS_DIR) / f"summary_{variant_name}.json"
+    if not summary_path.exists():
+        print(f"ERROR: {summary_path} not found", file=sys.stderr)
+        return False
+
+    summary = json.loads(summary_path.read_text())
+    pass_rate = summary["pass_rate"]
+    rate_label = f"{int(round(pass_rate * 100))}"
+
+    # Infer cycle from variant name if not given (e.g., "v1a" -> 1)
+    if cycle is None:
+        m = re.match(r"v(\d+)", variant_name)
+        if m:
+            cycle = int(m.group(1))
+
+    is_prompt_mode = not config.get("runner")
+
+    if is_prompt_mode:
+        current_path = Path(config.get("artifact")
+                            or ".autoresearch/prompts/current.txt")
+        candidate = Path(f".autoresearch/prompts/candidates/{variant_name}.txt")
+        if not candidate.exists():
+            print(f"ERROR: candidate {candidate} not found", file=sys.stderr)
+            return False
+        # Archive prior current
+        history_dir = Path(".autoresearch/prompts/history")
+        history_dir.mkdir(parents=True, exist_ok=True)
+        if current_path.exists() and cycle is not None:
+            archive = history_dir / f"v{cycle}_score{rate_label}.txt"
+            shutil.copy(current_path, archive)
+        # Apply winner
+        shutil.copy(candidate, current_path)
+        print(f"Promoted {variant_name}: {current_path} <- {candidate}")
+    else:
+        # Custom runner mode: archive current artifact state under history/
+        artifact = Path(config.get("artifact", "processor.py"))
+        if cycle is not None and artifact.exists():
+            history_dir = Path(f".autoresearch/history/v{cycle}_score{rate_label}")
+            history_dir.mkdir(parents=True, exist_ok=True)
+            if artifact.is_file():
+                shutil.copy(artifact, history_dir / artifact.name)
+            elif artifact.is_dir():
+                shutil.copytree(artifact, history_dir / artifact.name,
+                                dirs_exist_ok=True)
+        print(f"Promoted {variant_name}: {pass_rate:.0%} "
+              f"(assume {artifact} already in winning state)")
+
+    # Record in scores.json — always (this is the key win of this command)
+    effective_model = None if config.get("runner") else (
+        model or config.get("model", "sonnet"))
+    scores_path = Path(SCORES_FILE)
+    scores = json.loads(scores_path.read_text()) if scores_path.exists() else []
+    scores.append({
+        "prompt": "current",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "model": effective_model,
+        "pass_rate": pass_rate,
+        "assertion_pass_rates": summary.get("assertion_pass_rates", {}),
+        "promoted_from": variant_name,
+    })
+    scores_path.write_text(json.dumps(scores, indent=2))
+    print(f"Recorded {pass_rate:.0%} in {SCORES_FILE} (cycle {cycle})")
+
+    # Sync summary_current.json to reflect the new current (= the winning variant).
+    # Without this, summary_current.json reflects the last batch-assess of "current"
+    # before promotion — which is stale after the artifact is swapped.
+    current_summary = dict(summary)
+    current_summary["prompt"] = "current"
+    current_summary["timestamp"] = datetime.now(timezone.utc).isoformat()
+    current_summary["model"] = effective_model
+    current_summary["promoted_from"] = variant_name
+    (Path(RESULTS_DIR) / "summary_current.json").write_text(
+        json.dumps(current_summary, indent=2))
+    return True
+
+
+def cmd_promote(variant_name: str, cycle: int | None = None,
+                model: str | None = None):
+    """CLI entry point for promote."""
+    ok = _promote_winner(variant_name, cycle, model)
+    sys.exit(0 if ok else 1)
+
+
+# ---------------------------------------------------------------------------
+# report — deterministic formatted cycle report from summary JSONs
+# ---------------------------------------------------------------------------
+
+def cmd_report(cycle: int):
+    """Output a formatted markdown report for a specific cycle.
+
+    Reads summary_current.json and summary_v{cycle}{a,b,c,...}.json,
+    plus scores.json for the trajectory. Outputs a ready-to-display
+    table with per-assertion pass rates and aligned columns.
+    """
+    current_file = Path(RESULTS_DIR) / "summary_current.json"
+    if not current_file.exists():
+        print(f"ERROR: {current_file} not found", file=sys.stderr)
+        sys.exit(1)
+
+    current = json.loads(current_file.read_text())
+    current_rate = current["pass_rate"]
+    assertion_names = sorted(current.get("assertion_pass_rates", {}).keys())
+
+    # Collect variants for this cycle
+    variants = [("current", current)]
+    for suffix in "abcde":
+        vfile = Path(RESULTS_DIR) / f"summary_v{cycle}{suffix}.json"
+        if vfile.exists():
+            variants.append((f"v{cycle}{suffix}", json.loads(vfile.read_text())))
+
+    if len(variants) < 2:
+        print(f"No candidate summaries found for cycle {cycle}", file=sys.stderr)
+        sys.exit(1)
+
+    # Build rows first so we can compute column widths
+    columns = ["Variant", "Pass Rate"] + assertion_names + ["vs Current"]
+    rows = []
+    best_name, best_rate = "current", current_rate
+
+    for name, summary in variants:
+        rate = summary["pass_rate"]
+        a_rates = summary.get("assertion_pass_rates", {})
+
+        if name == "current":
+            delta = "—"
+        else:
+            d = (rate - current_rate) * 100
+            delta = f"+{d:.0f}%" if d >= 0 else f"{d:.0f}%"
+            if rate > best_rate:
+                best_name, best_rate = name, rate
+
+        row = [name, f"{rate:.0%}"]
+        row += [f"{a_rates.get(a, 0):.0%}" for a in assertion_names]
+        row += [delta]
+        rows.append(row)
+
+    # Compute column widths
+    widths = [len(c) for c in columns]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt_row(cells):
+        return "| " + " | ".join(c.ljust(widths[i]) for i, c in enumerate(cells)) + " |"
+
+    def fmt_sep():
+        return "|" + "|".join("-" * (w + 2) for w in widths) + "|"
+
+    # Print report
+    print(f"## Cycle {cycle} Results\n")
+    print(fmt_row(columns))
+    print(fmt_sep())
+    for row in rows:
+        print(fmt_row(row))
+
+    # Winner / no improvement
+    print()
+    if best_name != "current":
+        print(f"Winner: {best_name} ({best_rate:.0%})")
+    else:
+        print(f"No improvement. Current remains at {current_rate:.0%}.")
+
+    # Trajectory from scores.json
+    scores_path = Path(SCORES_FILE)
+    if scores_path.exists():
+        scores = json.loads(scores_path.read_text())
+        if scores:
+            trajectory = " → ".join(f"{s['pass_rate']:.0%}" for s in scores)
+            print(f"Trajectory: {trajectory}")
+
+
+def cmd_report_full():
+    """Full-run trajectory report across all cycles.
+
+    Reads scores.json and per-cycle summary files to produce a final
+    report: trajectory table (baseline + every promotion) plus overall
+    stats (cycles run, promotions, baseline, final, net delta).
+    """
+    scores_path = Path(SCORES_FILE)
+    if not scores_path.exists():
+        print(f"ERROR: {scores_path} not found — run baseline first", file=sys.stderr)
+        sys.exit(1)
+    scores = json.loads(scores_path.read_text())
+    if not scores:
+        print(f"ERROR: {scores_path} is empty", file=sys.stderr)
+        sys.exit(1)
+
+    # Infer highest cycle number from summary_v{cycle}{suffix}.json files
+    cycle_nums = []
+    for p in Path(RESULTS_DIR).glob("summary_v*.json"):
+        stem = p.stem.replace("summary_v", "")
+        num = ""
+        for ch in stem:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        if num:
+            cycle_nums.append(int(num))
+    total_cycles = max(cycle_nums) if cycle_nums else 0
+
+    baseline = scores[0]
+    final = scores[-1]
+    baseline_rate = baseline["pass_rate"]
+    final_rate = final["pass_rate"]
+    delta = (final_rate - baseline_rate) * 100
+
+    columns = ["Cycle", "Variant", "Pass Rate", "Δ vs Baseline", "Model"]
+    rows = [[
+        "0 (baseline)",
+        baseline.get("promoted_from") or "—",
+        f"{baseline_rate:.0%}",
+        "—",
+        baseline.get("model") or "—",
+    ]]
+    for i, s in enumerate(scores[1:], start=1):
+        d = (s["pass_rate"] - baseline_rate) * 100
+        delta_str = f"+{d:.0f}%" if d >= 0 else f"{d:.0f}%"
+        rows.append([
+            str(i),
+            s.get("promoted_from") or "—",
+            f"{s['pass_rate']:.0%}",
+            delta_str,
+            s.get("model") or "—",
+        ])
+
+    widths = [len(c) for c in columns]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt_row(cells):
+        return "| " + " | ".join(c.ljust(widths[i]) for i, c in enumerate(cells)) + " |"
+
+    def fmt_sep():
+        return "|" + "|".join("-" * (w + 2) for w in widths) + "|"
+
+    print("## Optimization Run — Final Report\n")
+    print(fmt_row(columns))
+    print(fmt_sep())
+    for row in rows:
+        print(fmt_row(row))
+
+    promotions = len(scores) - 1
+    delta_sign = "+" if delta >= 0 else ""
+    print()
+    print(f"Cycles run: {total_cycles}")
+    print(f"Promotions: {promotions}")
+    print(f"Baseline: {baseline_rate:.0%}")
+    print(f"Final:    {final_rate:.0%} ({delta_sign}{delta:.0f}% vs baseline)")
 
 
 # ---------------------------------------------------------------------------
@@ -432,12 +1002,14 @@ def main():
 
     elif command == "summarize":
         if len(sys.argv) < 3:
-            print("Usage: autoresearch-runner summarize <results-dir> [--output <file>] [--label <name>]", file=sys.stderr)
+            print("Usage: autoresearch-runner summarize <results-dir> [--output <file>] [--label <name>] [--model <name>]", file=sys.stderr)
             sys.exit(1)
         results_dir = sys.argv[2]
         output_path = None
         label = None
         track_score = False
+        # Model is only meaningful in SDK mode (no runner configured)
+        model = None if config.get("runner") else config.get("model", "sonnet")
         i = 3
         while i < len(sys.argv):
             if sys.argv[i] == "--output":
@@ -446,10 +1018,94 @@ def main():
                 label = sys.argv[i + 1]; i += 2
             elif sys.argv[i] == "--track-score":
                 track_score = True; i += 1
+            elif sys.argv[i] == "--model":
+                model = sys.argv[i + 1]; i += 2
             else:
                 print(f"Unknown flag: {sys.argv[i]}", file=sys.stderr)
                 sys.exit(1)
-        cmd_summarize(results_dir, output_path, label, track_score)
+        cmd_summarize(results_dir, output_path, label, track_score, model)
+
+    elif command == "batch-assess":
+        variants = []
+        track_baseline = False
+        promote_winner = False
+        model = config.get("model", "sonnet")
+        runner_cmd = config.get("runner")
+        # Default: parallel for SDK mode, sequential for custom runner
+        parallel = config.get("parallel", runner_cmd is None)
+        i = 2
+        while i < len(sys.argv):
+            if sys.argv[i] == "--variant":
+                # Format: name:artifact_path
+                parts = sys.argv[i + 1].split(":", 1)
+                if len(parts) != 2:
+                    print(f"ERROR: --variant must be name:path, got '{sys.argv[i + 1]}'",
+                          file=sys.stderr)
+                    sys.exit(1)
+                variants.append((parts[0], parts[1]))
+                i += 2
+            elif sys.argv[i] == "--track-baseline":
+                track_baseline = True; i += 1
+            elif sys.argv[i] == "--promote-winner":
+                promote_winner = True; i += 1
+            elif sys.argv[i] == "--model":
+                model = sys.argv[i + 1]; i += 2
+            elif sys.argv[i] == "--runner":
+                runner_cmd = sys.argv[i + 1]; i += 2
+            elif sys.argv[i] == "--assertions":
+                assertions_path = sys.argv[i + 1]; i += 2
+            elif sys.argv[i] == "--test-cases":
+                test_cases_path = sys.argv[i + 1]; i += 2
+            elif sys.argv[i] == "--parallel":
+                parallel = True; i += 1
+            elif sys.argv[i] == "--sequential":
+                parallel = False; i += 1
+            else:
+                print(f"Unknown flag: {sys.argv[i]}", file=sys.stderr)
+                sys.exit(1)
+
+        if not variants:
+            print("Usage: autoresearch-runner batch-assess --variant name:path "
+                  "[--variant name:path ...] [--track-baseline] [--promote-winner]",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        cmd_batch_assess(variants, assertions_path, test_cases_path,
+                         model, runner_cmd, parallel, track_baseline,
+                         promote_winner)
+
+    elif command == "promote":
+        if len(sys.argv) < 3:
+            print("Usage: autoresearch-runner promote <variant> [--cycle N] [--model <name>]",
+                  file=sys.stderr)
+            sys.exit(1)
+        variant = sys.argv[2]
+        cycle = None
+        model = None
+        i = 3
+        while i < len(sys.argv):
+            if sys.argv[i] == "--cycle":
+                cycle = int(sys.argv[i + 1]); i += 2
+            elif sys.argv[i] == "--model":
+                model = sys.argv[i + 1]; i += 2
+            else:
+                print(f"Unknown flag: {sys.argv[i]}", file=sys.stderr)
+                sys.exit(1)
+        cmd_promote(variant, cycle, model)
+
+    elif command == "report":
+        cycle = None
+        i = 2
+        while i < len(sys.argv):
+            if sys.argv[i] == "--cycle":
+                cycle = int(sys.argv[i + 1]); i += 2
+            else:
+                print(f"Unknown flag: {sys.argv[i]}", file=sys.stderr)
+                sys.exit(1)
+        if cycle is None:
+            cmd_report_full()
+        else:
+            cmd_report(cycle)
 
     elif command == "compare":
         if len(sys.argv) < 4:
