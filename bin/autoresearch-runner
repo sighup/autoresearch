@@ -6,7 +6,8 @@ Assesses artifacts against test cases using either the Claude Agent SDK
 
 Commands:
     autoresearch-runner assess --artifact P --test-case TC [--output FILE]
-    autoresearch-runner batch-assess --variant name:path [--variant ...] [--track-baseline]
+    autoresearch-runner batch-assess --variant name:path [--variant ...] [--track-baseline] [--promote-winner]
+    autoresearch-runner promote <variant> [--cycle N]
     autoresearch-runner report --cycle N
     autoresearch-runner summarize <results-dir> [--output FILE]
     autoresearch-runner compare <result1.json> <result2.json> ...
@@ -16,6 +17,8 @@ import asyncio
 import importlib.util
 import json
 import os
+import re
+import shutil
 import subprocess as _sp
 import sys
 import time
@@ -254,7 +257,7 @@ def cmd_assess(artifact_path: str, test_case_id: str, assertions_path: str,
 # ---------------------------------------------------------------------------
 
 def cmd_summarize(results_dir: str, output_path: str | None, prompt_label: str | None,
-                   track_score: bool = False):
+                   track_score: bool = False, model: str | None = None):
     """Aggregate individual test case results into a run summary."""
     results_path = Path(results_dir)
     if not results_path.is_dir():
@@ -316,6 +319,7 @@ def cmd_summarize(results_dir: str, output_path: str | None, prompt_label: str |
     run_result = {
         "prompt": prompt_label or results_dir,
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "model": model,
         "pass_rate": round(pass_rate, 3),
         "passed": passed,
         "total": total,
@@ -351,6 +355,7 @@ def cmd_summarize(results_dir: str, output_path: str | None, prompt_label: str |
         scores.append({
             "prompt": prompt_label or results_dir,
             "timestamp": run_result["timestamp"],
+            "model": model,
             "pass_rate": run_result["pass_rate"],
             "assertion_pass_rates": assertion_rates,
         })
@@ -488,7 +493,8 @@ async def _assess_one_async(variant_name: str, artifact_path: str, case: dict,
 
 
 def _summarize_results(variant_name: str, results: list[dict],
-                       track_score: bool = False) -> dict:
+                       track_score: bool = False,
+                       model: str | None = None) -> dict:
     """Summarize a list of result dicts into a run summary. Returns the summary."""
     passed = sum(1 for r in results if r["passed"])
     total = len(results)
@@ -515,6 +521,7 @@ def _summarize_results(variant_name: str, results: list[dict],
     summary = {
         "prompt": variant_name,
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "model": model,
         "pass_rate": round(pass_rate, 3),
         "passed": passed,
         "total": total,
@@ -533,6 +540,7 @@ def _summarize_results(variant_name: str, results: list[dict],
         scores.append({
             "prompt": variant_name,
             "timestamp": summary["timestamp"],
+            "model": model,
             "pass_rate": summary["pass_rate"],
             "assertion_pass_rates": assertion_rates,
         })
@@ -543,10 +551,12 @@ def _summarize_results(variant_name: str, results: list[dict],
 
 def cmd_batch_assess(variants: list[tuple[str, str]], assertions_path: str,
                      test_cases_path: str, model: str, runner_cmd: str | None,
-                     parallel: bool, track_baseline: bool = False):
+                     parallel: bool, track_baseline: bool = False,
+                     promote_winner: bool = False):
     """Assess all test cases for multiple variants, summarize, and compare.
 
     variants: list of (name, artifact_path) tuples
+    If promote_winner: auto-call promote on the winning variant at the end.
     """
     test_cases = load_all_test_cases(test_cases_path)
     assertions = load_assertions(assertions_path)
@@ -555,6 +565,8 @@ def cmd_batch_assess(variants: list[tuple[str, str]], assertions_path: str,
         _ensure_venv()
 
     print(f"Batch assessment: {len(variants)} variant(s) x {len(test_cases)} test cases")
+    mode = "custom runner" if runner_cmd else f"sdk ({model})"
+    print(f"Mode: {mode}")
     print(f"Parallelism: {'enabled' if parallel else 'disabled'}")
     print("=" * 60)
 
@@ -586,9 +598,12 @@ def cmd_batch_assess(variants: list[tuple[str, str]], assertions_path: str,
                 result_path = variant_dir / f"{result['id']}.json"
                 result_path.write_text(json.dumps(result, indent=2))
 
-            # Summarize
+            # Summarize — model is only meaningful in SDK mode
             should_track = track_baseline and variant_name == "current"
-            summary = _summarize_results(variant_name, results, track_score=should_track)
+            effective_model = None if runner_cmd else model
+            summary = _summarize_results(variant_name, results,
+                                         track_score=should_track,
+                                         model=effective_model)
             all_summaries.append((variant_name, summary["pass_rate"]))
 
             print(f"  Summary: {summary['passed']}/{summary['total']}"
@@ -652,6 +667,9 @@ def cmd_batch_assess(variants: list[tuple[str, str]], assertions_path: str,
 
         if best_name != "current":
             print(f"\nWinner: {best_name} ({best_rate:.0%})")
+            if promote_winner:
+                print()
+                _promote_winner(best_name, model=model)
         elif current_rate is not None:
             print(f"\nNo improvement. Current: {current_rate:.0%}")
 
@@ -662,6 +680,106 @@ def cmd_batch_assess(variants: list[tuple[str, str]], assertions_path: str,
             if scores:
                 trajectory = " → ".join(f"{s['pass_rate']:.0%}" for s in scores)
                 print(f"Trajectory: {trajectory}")
+
+
+# ---------------------------------------------------------------------------
+# promote — apply a winning variant to current, archive prior state, track score
+# ---------------------------------------------------------------------------
+
+def _promote_winner(variant_name: str, cycle: int | None = None,
+                    model: str | None = None) -> bool:
+    """Apply variant_name as the new current, archive prior state, record score.
+
+    Returns True on success, False if the variant summary is missing.
+    Behavior depends on mode:
+      - Prompt mode: copies candidates/<variant>.txt -> current.txt
+      - Custom runner mode: archives current artifact, assumes caller has
+        already applied the change to the artifact file.
+    In both modes: appends the variant's pass_rate to scores.json with a
+    'promoted_from' field.
+    """
+    config = load_config()
+    summary_path = Path(RESULTS_DIR) / f"summary_{variant_name}.json"
+    if not summary_path.exists():
+        print(f"ERROR: {summary_path} not found", file=sys.stderr)
+        return False
+
+    summary = json.loads(summary_path.read_text())
+    pass_rate = summary["pass_rate"]
+    rate_label = f"{int(round(pass_rate * 100))}"
+
+    # Infer cycle from variant name if not given (e.g., "v1a" -> 1)
+    if cycle is None:
+        m = re.match(r"v(\d+)", variant_name)
+        if m:
+            cycle = int(m.group(1))
+
+    is_prompt_mode = not config.get("runner")
+
+    if is_prompt_mode:
+        current_path = Path(config.get("artifact")
+                            or ".autoresearch/prompts/current.txt")
+        candidate = Path(f".autoresearch/prompts/candidates/{variant_name}.txt")
+        if not candidate.exists():
+            print(f"ERROR: candidate {candidate} not found", file=sys.stderr)
+            return False
+        # Archive prior current
+        history_dir = Path(".autoresearch/prompts/history")
+        history_dir.mkdir(parents=True, exist_ok=True)
+        if current_path.exists() and cycle is not None:
+            archive = history_dir / f"v{cycle}_score{rate_label}.txt"
+            shutil.copy(current_path, archive)
+        # Apply winner
+        shutil.copy(candidate, current_path)
+        print(f"Promoted {variant_name}: {current_path} <- {candidate}")
+    else:
+        # Custom runner mode: archive current artifact state under history/
+        artifact = Path(config.get("artifact", "processor.py"))
+        if cycle is not None and artifact.exists():
+            history_dir = Path(f".autoresearch/history/v{cycle}_score{rate_label}")
+            history_dir.mkdir(parents=True, exist_ok=True)
+            if artifact.is_file():
+                shutil.copy(artifact, history_dir / artifact.name)
+            elif artifact.is_dir():
+                shutil.copytree(artifact, history_dir / artifact.name,
+                                dirs_exist_ok=True)
+        print(f"Promoted {variant_name}: {pass_rate:.0%} "
+              f"(assume {artifact} already in winning state)")
+
+    # Record in scores.json — always (this is the key win of this command)
+    effective_model = None if config.get("runner") else (
+        model or config.get("model", "sonnet"))
+    scores_path = Path(SCORES_FILE)
+    scores = json.loads(scores_path.read_text()) if scores_path.exists() else []
+    scores.append({
+        "prompt": "current",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "model": effective_model,
+        "pass_rate": pass_rate,
+        "assertion_pass_rates": summary.get("assertion_pass_rates", {}),
+        "promoted_from": variant_name,
+    })
+    scores_path.write_text(json.dumps(scores, indent=2))
+    print(f"Recorded {pass_rate:.0%} in {SCORES_FILE} (cycle {cycle})")
+
+    # Sync summary_current.json to reflect the new current (= the winning variant).
+    # Without this, summary_current.json reflects the last batch-assess of "current"
+    # before promotion — which is stale after the artifact is swapped.
+    current_summary = dict(summary)
+    current_summary["prompt"] = "current"
+    current_summary["timestamp"] = datetime.now(timezone.utc).isoformat()
+    current_summary["model"] = effective_model
+    current_summary["promoted_from"] = variant_name
+    (Path(RESULTS_DIR) / "summary_current.json").write_text(
+        json.dumps(current_summary, indent=2))
+    return True
+
+
+def cmd_promote(variant_name: str, cycle: int | None = None,
+                model: str | None = None):
+    """CLI entry point for promote."""
+    ok = _promote_winner(variant_name, cycle, model)
+    sys.exit(0 if ok else 1)
 
 
 # ---------------------------------------------------------------------------
@@ -803,12 +921,14 @@ def main():
 
     elif command == "summarize":
         if len(sys.argv) < 3:
-            print("Usage: autoresearch-runner summarize <results-dir> [--output <file>] [--label <name>]", file=sys.stderr)
+            print("Usage: autoresearch-runner summarize <results-dir> [--output <file>] [--label <name>] [--model <name>]", file=sys.stderr)
             sys.exit(1)
         results_dir = sys.argv[2]
         output_path = None
         label = None
         track_score = False
+        # Model is only meaningful in SDK mode (no runner configured)
+        model = None if config.get("runner") else config.get("model", "sonnet")
         i = 3
         while i < len(sys.argv):
             if sys.argv[i] == "--output":
@@ -817,14 +937,17 @@ def main():
                 label = sys.argv[i + 1]; i += 2
             elif sys.argv[i] == "--track-score":
                 track_score = True; i += 1
+            elif sys.argv[i] == "--model":
+                model = sys.argv[i + 1]; i += 2
             else:
                 print(f"Unknown flag: {sys.argv[i]}", file=sys.stderr)
                 sys.exit(1)
-        cmd_summarize(results_dir, output_path, label, track_score)
+        cmd_summarize(results_dir, output_path, label, track_score, model)
 
     elif command == "batch-assess":
         variants = []
         track_baseline = False
+        promote_winner = False
         model = config.get("model", "sonnet")
         runner_cmd = config.get("runner")
         # Default: parallel for SDK mode, sequential for custom runner
@@ -842,6 +965,8 @@ def main():
                 i += 2
             elif sys.argv[i] == "--track-baseline":
                 track_baseline = True; i += 1
+            elif sys.argv[i] == "--promote-winner":
+                promote_winner = True; i += 1
             elif sys.argv[i] == "--model":
                 model = sys.argv[i + 1]; i += 2
             elif sys.argv[i] == "--runner":
@@ -860,11 +985,32 @@ def main():
 
         if not variants:
             print("Usage: autoresearch-runner batch-assess --variant name:path "
-                  "[--variant name:path ...] [--track-baseline]", file=sys.stderr)
+                  "[--variant name:path ...] [--track-baseline] [--promote-winner]",
+                  file=sys.stderr)
             sys.exit(1)
 
         cmd_batch_assess(variants, assertions_path, test_cases_path,
-                         model, runner_cmd, parallel, track_baseline)
+                         model, runner_cmd, parallel, track_baseline,
+                         promote_winner)
+
+    elif command == "promote":
+        if len(sys.argv) < 3:
+            print("Usage: autoresearch-runner promote <variant> [--cycle N] [--model <name>]",
+                  file=sys.stderr)
+            sys.exit(1)
+        variant = sys.argv[2]
+        cycle = None
+        model = None
+        i = 3
+        while i < len(sys.argv):
+            if sys.argv[i] == "--cycle":
+                cycle = int(sys.argv[i + 1]); i += 2
+            elif sys.argv[i] == "--model":
+                model = sys.argv[i + 1]; i += 2
+            else:
+                print(f"Unknown flag: {sys.argv[i]}", file=sys.stderr)
+                sys.exit(1)
+        cmd_promote(variant, cycle, model)
 
     elif command == "report":
         cycle = None

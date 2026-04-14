@@ -197,25 +197,23 @@ The runner handles test-case parallelism internally based on the `parallel` conf
 
 ### 6. Promote winner (if any)
 
-Read the summary files from `.autoresearch/results/summary_*.json` (already produced by batch-assess) to determine the winner.
+`batch-assess` already printed the winner (look for the `Winner: v{cycle}X` line). If a candidate beats current, promote it with ONE command:
 
-If a candidate beats the current best:
+```bash
+autoresearch-runner promote v{cycle}a --cycle {cycle}
+```
 
-**Prompt mode**:
-1. Copy current to `.autoresearch/prompts/history/v{cycle}_score{rate}.txt`
-2. Copy winning candidate to `.autoresearch/prompts/current.txt`
-3. Record the winner's score in scores.json:
-   ```bash
-   autoresearch-runner summarize .autoresearch/results/<winner>/ --output .autoresearch/results/summary_<winner>.json --label <winner> --track-score
-   ```
-4. Clear `.autoresearch/prompts/candidates/`
+This single command:
+1. Archives the previous current artifact to `.autoresearch/history/v{cycle}_score{rate}/` (custom runner) or `.autoresearch/prompts/history/v{cycle}_score{rate}.txt` (prompt mode)
+2. Applies the winner (prompt mode: copies candidate to current.txt; custom runner: assumes you've already applied the change and just archives)
+3. Appends the winner's pass_rate to `scores.json` — so the trajectory and scorecard are always complete
 
-**Custom runner mode**:
-1. Save the current artifact state to `.autoresearch/history/v{cycle}_score{rate}/` (copy the relevant files)
-2. Apply the winning change to the artifact
-3. Record score as above
+**Prompt mode**: call `promote` directly — it copies the candidate file to current.
+**Custom runner mode**: re-apply the winning change to the artifact file FIRST (since variants are restored after assessment), THEN call `promote`.
 
-If no candidate beats current, note what was tried in `.autoresearch/results/failure_analysis.txt`.
+**Alternative one-step for prompt mode**: pass `--promote-winner` to `batch-assess` and it auto-promotes the winner if one exists.
+
+If no candidate beats current, note what was tried in `.autoresearch/results/failure_analysis.txt`. Do NOT call `promote`.
 
 ### 7. Repeat
 

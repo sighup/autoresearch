@@ -1,7 +1,0 @@
-{
-  "artifact": "processor.py",
-  "runner": "bash .autoresearch/runner.sh",
-  "assertions": ".autoresearch/assertions.py",
-  "test_cases": ".autoresearch/test_cases.jsonl",
-  "parallel": true
-}

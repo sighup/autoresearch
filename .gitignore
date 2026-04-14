@@ -3,6 +3,5 @@ __pycache__/
 .env
 .venv/
 .autoresearch/
-benchmarks/results/
-benchmarks/targets/*/.autoresearch/results/
-benchmarks/targets/*/.autoresearch/history/
+benchmarks/
+work/
