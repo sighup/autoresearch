@@ -1,6 +1,0 @@
-[project]
-name = "autoresearch"
-version = "0.1.0"
-description = "Claude Code plugin for iterative optimization through automated evaluation"
-requires-python = ">=3.10"
-dependencies = ["claude-agent-sdk"]
