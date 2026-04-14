@@ -8,7 +8,7 @@ Commands:
     autoresearch-runner assess --artifact P --test-case TC [--output FILE]
     autoresearch-runner batch-assess --variant name:path [--variant ...] [--track-baseline] [--promote-winner]
     autoresearch-runner promote <variant> [--cycle N]
-    autoresearch-runner report --cycle N
+    autoresearch-runner report [--cycle N]
     autoresearch-runner summarize <results-dir> [--output FILE]
     autoresearch-runner compare <result1.json> <result2.json> ...
 """
@@ -870,6 +870,87 @@ def cmd_report(cycle: int):
             print(f"Trajectory: {trajectory}")
 
 
+def cmd_report_full():
+    """Full-run trajectory report across all cycles.
+
+    Reads scores.json and per-cycle summary files to produce a final
+    report: trajectory table (baseline + every promotion) plus overall
+    stats (cycles run, promotions, baseline, final, net delta).
+    """
+    scores_path = Path(SCORES_FILE)
+    if not scores_path.exists():
+        print(f"ERROR: {scores_path} not found — run baseline first", file=sys.stderr)
+        sys.exit(1)
+    scores = json.loads(scores_path.read_text())
+    if not scores:
+        print(f"ERROR: {scores_path} is empty", file=sys.stderr)
+        sys.exit(1)
+
+    # Infer highest cycle number from summary_v{cycle}{suffix}.json files
+    cycle_nums = []
+    for p in Path(RESULTS_DIR).glob("summary_v*.json"):
+        stem = p.stem.replace("summary_v", "")
+        num = ""
+        for ch in stem:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        if num:
+            cycle_nums.append(int(num))
+    total_cycles = max(cycle_nums) if cycle_nums else 0
+
+    baseline = scores[0]
+    final = scores[-1]
+    baseline_rate = baseline["pass_rate"]
+    final_rate = final["pass_rate"]
+    delta = (final_rate - baseline_rate) * 100
+
+    columns = ["Cycle", "Variant", "Pass Rate", "Δ vs Baseline", "Model"]
+    rows = [[
+        "0 (baseline)",
+        baseline.get("promoted_from") or "—",
+        f"{baseline_rate:.0%}",
+        "—",
+        baseline.get("model") or "—",
+    ]]
+    for i, s in enumerate(scores[1:], start=1):
+        d = (s["pass_rate"] - baseline_rate) * 100
+        delta_str = f"+{d:.0f}%" if d >= 0 else f"{d:.0f}%"
+        rows.append([
+            str(i),
+            s.get("promoted_from") or "—",
+            f"{s['pass_rate']:.0%}",
+            delta_str,
+            s.get("model") or "—",
+        ])
+
+    widths = [len(c) for c in columns]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt_row(cells):
+        return "| " + " | ".join(c.ljust(widths[i]) for i, c in enumerate(cells)) + " |"
+
+    def fmt_sep():
+        return "|" + "|".join("-" * (w + 2) for w in widths) + "|"
+
+    print("## Optimization Run — Final Report\n")
+    print(fmt_row(columns))
+    print(fmt_sep())
+    for row in rows:
+        print(fmt_row(row))
+
+    promotions = len(scores) - 1
+    delta_sign = "+" if delta >= 0 else ""
+    print()
+    print(f"Cycles run: {total_cycles}")
+    print(f"Promotions: {promotions}")
+    print(f"Baseline: {baseline_rate:.0%}")
+    print(f"Final:    {final_rate:.0%} ({delta_sign}{delta:.0f}% vs baseline)")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1022,9 +1103,9 @@ def main():
                 print(f"Unknown flag: {sys.argv[i]}", file=sys.stderr)
                 sys.exit(1)
         if cycle is None:
-            print("Usage: autoresearch-runner report --cycle N", file=sys.stderr)
-            sys.exit(1)
-        cmd_report(cycle)
+            cmd_report_full()
+        else:
+            cmd_report(cycle)
 
     elif command == "compare":
         if len(sys.argv) < 4:
